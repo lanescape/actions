@@ -37,15 +37,28 @@ jobs:
       - id: runners
         uses: lanescape/actions/runners@v1
         with:
-          disks: '{"build": {"runner": "lanescape-80vcpu-linux-amd64", "spot": true, "key": "3f9c2e7a10b4d5e6f708"}}'
+          disks: '{"build": {"runner": "lanescape-80vcpu-linux-amd64", "spot": true, "from": ["deps/versions.json", "rust-toolchain.toml"]}}'
   build:
     needs: runners
     runs-on: ${{ fromJSON(needs.runners.outputs.map)['build'] }}
 ```
 
+Each entry in `disks` is a saved work disk the workflow's jobs use, named by its family, a name of 1 to 32 lowercase letters, digits and hyphens starting with a letter, and has:
+
+- **`runner`:** the name of a runner in `.github/runners.json`.
+- **`spot`:** `true` to run on Spot machines, which can be preempted, so the job must be able to carry on from its work disk on a rerun. Standard machines otherwise.
+- **`from`,** optionally: the files the disk's contents depend on, such as a list of dependency versions and a toolchain file. The action reads them through GitHub's API at the commit the job builds: the run's own commit, by its SHA, never a moving ref; and in a `pull_request_target` run, the contribution's own, `github.event.pull_request.head.sha` in the head repository, which is what the contribution's jobs check out, even though `.github/runners.json` is read from the default branch there. A listed file that doesn't exist fails the action, naming it.
+
+  The key is the first 20 hex digits of the SHA-256 of these parts, in this order: the family, the runner, then each listed path and its contents, in the order listed. Each part is written as its length in bytes, an unsigned 64-bit big-endian number, followed by its bytes: names and paths in UTF-8, and contents exactly as the file's bytes at that commit. For example, family `build`, runner `lanescape-80vcpu-linux-amd64`, `deps/versions.json` holding `café 1.0` and a newline, and an empty `rust-toolchain.toml`, give the key `a77434447088c41f6e9f`. So the key changes when a listed file's contents do, and also when the family, the runner, the paths or their order do.
+- **`key`,** optionally, instead of `from`: the key itself, 20 lowercase hex digits, for a disk whose inputs aren't files in the repository.
+
+With neither `from` nor `key`, the family has one key per scope and architecture, `00000000000000000000`, since the service's selectors always carry one. A save that the service accepts makes a newer version of that disk, and later runs restore the newest. That's enough for most jobs, since a build redoes only what's out of date. A save doesn't pass a disk to a later job of the same run: the service picks each run's disk once, for all its jobs with the same selector.
+
+Whatever the key, a job restores by the service's order: its pull request's disk for that key, then its pull request's newest disk of the family, then main's for that key, then main's newest of the family, then an empty disk. A pull request that changes a listed file gets a new key, so it saves beside main's disk rather than over it.
+
 The output `map` has an entry for each name in `.github/runners.json`, and one for each entry in `disks`, named by its family:
 
-- **Inside the organization,** each runner name maps to its selector for this run, with the scope the binding returned: `lanescape-80vcpu-linux-amd64-pr42`. Each disk entry maps to its runner's selector with `-spot` if asked and `-disk-<family>-<key>`: `lanescape-80vcpu-linux-amd64-spot-disk-build-3f9c2e7a10b4d5e6f708-pr42`. The service checks every selector against the run's binding before a job runs. If the binding answers that GitHub couldn't be reached, the action retries with backoff, and fails only once its retries are spent.
+- **Inside the organization,** each runner name maps to its selector for this run, with the scope the binding returned: `lanescape-80vcpu-linux-amd64-pr42`. Each disk entry maps to its runner's selector with `-spot` if asked and `-disk-<family>-<key>`, with the key it was given or made: `lanescape-80vcpu-linux-amd64-spot-disk-build-3f9c2e7a10b4d5e6f708-pr42`. The service checks every selector against the run's binding before a job runs. If the binding answers that GitHub couldn't be reached, the action retries with backoff, and fails only once its retries are spent.
 - **Outside,** each runner name maps to its fallback, and each disk entry to its runner's fallback. A fork can override any fallback with a repository or organization variable `RUNNERS`, a JSON object in the same shape as `.github/runners.json`, whose values may be a label or a list of labels. Names it doesn't override keep the file's fallback, and names the file doesn't list are ignored. For a fork's pull request into an organization repository, the action ignores `RUNNERS` from the base repository, since it's the organization's.
 
 A job that asks for a name the map lacks gets an empty label, which GitHub refuses; the action's summary lists the names it has.
