@@ -16,8 +16,8 @@ github.com/google/go-querystring v1.2.0 h1:yhqkPbu2/OH+V9BfpCVPZkNmUXhb2gBxJArfh
 github.com/google/go-querystring v1.2.0/go.mod h1:8IFJqpSRITyJ8QhQ13bmbeMBDfmeEJZD5A0egEOmkqU=
 github.com/jonboulle/clockwork v0.5.0 h1:Hyh9A8u51kptdkR+cqRpT1EebBwTn1oK9YfGYbdFz6I=
 github.com/jonboulle/clockwork v0.5.0/go.mod h1:3mZlmanh0g2NDKO5TWZVJAfofYk64M7XN3SzBPjZF60=
-github.com/lanescape/runners v0.0.0-20261109125402-69940f3c6d9c h1:22fv5D5P0OFamxbo+uwqT9ivEV+Zii7MaWeKMkcoHOc=
-github.com/lanescape/runners v0.0.0-20261109125402-69940f3c6d9c/go.mod h1:L8mLPna6rBkWgSnYDPHWf2059nj7q71++E121lQPT8I=
+github.com/lanescape/runners v0.0.0-20261109143032-15d91cbef7d7 h1:E5ja37vlCgQgvPGH2rN4TxkhMsvw/SAoDojdCwK1284=
+github.com/lanescape/runners v0.0.0-20261109143032-15d91cbef7d7/go.mod h1:L8mLPna6rBkWgSnYDPHWf2059nj7q71++E121lQPT8I=
 go.yaml.in/yaml/v3 v3.0.6 h1:zcDfvjXEqTQmpjniUBLc91xYJMB2c4QOFxEF/LCEckM=
 go.yaml.in/yaml/v3 v3.0.6/go.mod h1:HVTZu1O7/Vkt2N+BFy8Zza+lnLsABggaTM2ZpNIGuKg=
 golang.org/x/oauth2 v0.37.0 h1:JUlcxA8oAtauLfiH8FX2/FkAWHAdi0QtGCGc+hofE98=

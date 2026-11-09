@@ -8,7 +8,7 @@ require (
 	// lanescape/runners pins a commit of its implementation branch until that
 	// merges and is tagged; move the pin then, in a pull request of its own
 	// (specs/0002-releases.md).
-	github.com/lanescape/runners v0.0.0-20261109125402-69940f3c6d9c
+	github.com/lanescape/runners v0.0.0-20261109143032-15d91cbef7d7
 	go.yaml.in/yaml/v3 v3.0.6
 )
 
