@@ -15,12 +15,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"time"
 
 	"github.com/lanescape/runners/endpoints"
 
 	"github.com/lanescape/actions/internal/backoff"
+	"github.com/lanescape/actions/internal/selector"
 )
 
 // Tokens gets the job's OIDC token for an audience.
@@ -86,8 +86,6 @@ func (r *Refused) Error() string { return "the runner service refused to bind th
 // ErrUnavailable means the service kept answering that GitHub couldn't
 // confirm the run until the retries were spent.
 var ErrUnavailable = errors.New("the runner service couldn't bind the run, since GitHub couldn't confirm it, and the retries are spent")
-
-var scopePattern = regexp.MustCompile(`^(main|read|pr[1-9][0-9]*)$`)
 
 // Bind binds the run's scope, or returns the binding it has (POST
 // /v1/bind). req is nil except from a bootstrap workflow in a
@@ -173,7 +171,7 @@ func (c *Client) bindOnce(ctx context.Context, body []byte) (string, time.Durati
 	asked := backoff.RetryAfter(resp.Header, time.Now())
 	switch {
 	case resp.StatusCode == http.StatusOK:
-		if jsonErr != nil || !scopePattern.MatchString(out.Scope) {
+		if jsonErr != nil || !selector.Scope.MatchString(out.Scope) {
 			return "", 0, final{errors.New("the runner service answered 200 without a scope")}
 		}
 		return out.Scope, 0, nil

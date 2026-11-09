@@ -1,5 +1,6 @@
 // Package repo checks what holds across the repository: the actions'
-// metadata, the workflows' pins, and the version of lanescape/runners.
+// metadata, the workflows' pins, and the steps that build the actions'
+// programs and move the release's tag.
 package repo
 
 import (
@@ -153,35 +154,5 @@ func TestUsesArePinned(t *testing.T) {
 	}
 	if n == 0 {
 		t.Fatal("found no uses")
-	}
-}
-
-// The service harness builds the service at the version go.mod names.
-func TestTheHarnessUsesGoModsRunners(t *testing.T) {
-	version := func(path string) string {
-		b, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		m := regexp.MustCompile(`(?m)^\s*(?:require\s+)?github\.com/lanescape/runners\s+(\S+)`).FindStringSubmatch(string(b))
-		if m == nil {
-			t.Fatalf("%s doesn't require lanescape/runners", path)
-		}
-		return m[1]
-	}
-	toolchain := func(path string) string {
-		b, _ := os.ReadFile(path)
-		m := regexp.MustCompile(`(?m)^toolchain (\S+)$`).FindStringSubmatch(string(b))
-		if m == nil {
-			t.Fatalf("%s has no toolchain line", path)
-		}
-		return m[1]
-	}
-	main, harness := filepath.Join(root, "go.mod"), filepath.Join(root, "servicetest", "go.mod")
-	if a, b := version(main), version(harness); a != b {
-		t.Errorf("go.mod names lanescape/runners %s, and servicetest/go.mod %s", a, b)
-	}
-	if a, b := toolchain(main), toolchain(harness); a != b {
-		t.Errorf("go.mod's toolchain is %s, and servicetest/go.mod's %s", a, b)
 	}
 }

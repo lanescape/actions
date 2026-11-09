@@ -2,7 +2,8 @@ package main
 
 // These tests run the program in-process against the GitHub emulator,
 // outside the organization, and up to the binding inside it. The
-// end-to-end tests (e2e/) run the built program against the real service.
+// end-to-end tests (e2e/) run the built program against lanescape/runners'
+// emulator of the service.
 
 import (
 	"bytes"

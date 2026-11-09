@@ -11,7 +11,8 @@ func TestParse(t *testing.T) {
 	f, err := Parse([]byte(`{
 		"lanescape-80vcpu-linux-amd64": "ubuntu-24.04",
 		"lanescape-2vcpu-linux-arm64": ["self-hosted", "arm64"],
-		"bootstrap": "lanescape/app/.github/workflows/bootstrap.yml@refs/heads/main"
+		"bootstrap": "lanescape/app/.github/workflows/bootstrap.yml@refs/heads/main",
+		"branches": {"support/v1": "v1", "release": "r2026"}
 	}`))
 	if err != nil {
 		t.Fatal(err)
@@ -21,6 +22,9 @@ func TestParse(t *testing.T) {
 	}
 	if f.Bootstrap != "lanescape/app/.github/workflows/bootstrap.yml@refs/heads/main" {
 		t.Errorf("bootstrap = %q", f.Bootstrap)
+	}
+	if b, _ := json.Marshal(f.Branches); string(b) != `{"release":"r2026","support/v1":"v1"}` {
+		t.Errorf("branches = %s", b)
 	}
 	b, _ := json.Marshal(f.Fallbacks)
 	if string(b) != `{"lanescape-2vcpu-linux-arm64":["self-hosted","arm64"],"lanescape-80vcpu-linux-amd64":"ubuntu-24.04"}` {
@@ -43,6 +47,13 @@ func TestParseRefuses(t *testing.T) {
 		"label in a list": {`{"lanescape-2vcpu-linux-amd64": ["a", " b"]}`, "isn't a runner label"},
 		"twice":           {`{"lanescape-2vcpu-linux-amd64": "a", "lanescape-2vcpu-linux-amd64": "b"}`, "twice"},
 		"bad bootstrap":   {`{"lanescape-2vcpu-linux-amd64": "a", "bootstrap": 1}`, "bootstrap must be"},
+		"branches list":   {`{"lanescape-2vcpu-linux-amd64": "a", "branches": ["v1"]}`, "branches isn't a JSON object"},
+		"branch twice":    {`{"lanescape-2vcpu-linux-amd64": "a", "branches": {"v1": "a", "v1": "b"}}`, `branches names "v1" twice`},
+		"empty branch":    {`{"lanescape-2vcpu-linux-amd64": "a", "branches": {"": "v1"}}`, "a branch's name is empty"},
+		"bad scope name":  {`{"lanescape-2vcpu-linux-amd64": "a", "branches": {"support/v1": "V1"}}`, "support/v1's scope must be named"},
+		"long scope name": {`{"lanescape-2vcpu-linux-amd64": "a", "branches": {"x": "a2345678901234567"}}`, "x's scope must be named"},
+		"scope name list": {`{"lanescape-2vcpu-linux-amd64": "a", "branches": {"x": ["v1"]}}`, "x's scope must be named"},
+		"shared scope":    {`{"lanescape-2vcpu-linux-amd64": "a", "branches": {"x": "v1", "y": "v1"}}`, "x and y both name the scope v1"},
 	} {
 		_, err := Parse([]byte(tc.data))
 		if err == nil || !strings.Contains(err.Error(), tc.want) {

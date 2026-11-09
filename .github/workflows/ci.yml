@@ -39,14 +39,10 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          cache-dependency-path: |
-            go.sum
-            servicetest/go.sum
       - name: go vet
         run: |
           go vet ./...
           go vet -tags e2e ./...
-          (cd servicetest && GOWORK=off go vet ./...)
       - name: gofmt
         run: |
           unformatted="$(gofmt -l .)"

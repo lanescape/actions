@@ -67,12 +67,12 @@ func TestPatterns(t *testing.T) {
 			t.Errorf("%q is a family", s)
 		}
 	}
-	for _, s := range []string{"main", "read", "pr1", "pr42"} {
+	for _, s := range []string{"main", "read", "pr1", "pr42", "branch-v1", "branch-a234567890123456"} {
 		if !Scope.MatchString(s) {
 			t.Errorf("%s isn't a scope", s)
 		}
 	}
-	for _, s := range []string{"pr0", "pr", "pr01", "Main", "dev"} {
+	for _, s := range []string{"pr0", "pr", "pr01", "Main", "dev", "branch-", "branch-1a", "branch-V1", "branch-a-b", "branch-a2345678901234567"} {
 		if Scope.MatchString(s) {
 			t.Errorf("%s is a scope", s)
 		}

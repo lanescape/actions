@@ -19,8 +19,13 @@ var (
 	Family = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
 	// Key is a disk's key: exactly 20 lowercase hex digits.
 	Key = regexp.MustCompile(`^[0-9a-f]{20}$`)
-	// Scope is a binding's scope.
-	Scope = regexp.MustCompile(`^(main|read|pr[1-9][0-9]*)$`)
+	// Scope is a binding's scope: main, a long-lived branch's
+	// branch-<name>, a pull request's pr<number>, or read.
+	Scope = regexp.MustCompile(`^(main|read|pr[1-9][0-9]*|branch-[a-z][a-z0-9]{0,15})$`)
+	// ScopeName is the name a consumer gives a long-lived branch's scope
+	// in .github/runners.json: 1 to 16 lowercase letters and digits,
+	// starting with a letter.
+	ScopeName = regexp.MustCompile(`^[a-z][a-z0-9]{0,15}$`)
 )
 
 // NoKey is a family's one key when its disk entry gives neither from nor

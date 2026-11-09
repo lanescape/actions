@@ -1,11 +1,19 @@
 // Package e2e runs the actions' programs as GitHub would run them, with a
-// job's environment and event, against the real runner service at the
-// version go.mod names, built from lanescape/runners by ../servicetest, and
-// that repository's own GitHub emulator and its OIDC issuer
-// (specs/0002-releases.md, Tests).
+// job's environment and event, against lanescape/runners' emulator of the
+// service, emulators/service, at the version go.mod names, and that
+// repository's own GitHub emulator and its OIDC issuer
+// (specs/0002-releases.md, Tests). That repository's conformance suite
+// holds the emulator to the real service's answers.
 //
-// The programs are built with the e2e tag, which lets them call the test
-// service in place of endpoints.Service and wait milliseconds between
+// GitHub appears twice: the GitHub emulator serves the API, event and
+// tokens a job sees, and the service emulator's World is what the service
+// learns of GitHub. Each test makes the same repository, branches, pull
+// requests, runs and jobs in both, with the same organization, repository
+// and fork IDs and pull request numbers. Each emulator makes its own commit
+// SHAs, which only a bootstrap's binding request names (sameHead).
+//
+// The programs are built with the e2e tag, which lets them call the
+// emulator in place of endpoints.Service and wait milliseconds between
 // retries; nothing else differs from what the actions build.
 package e2e
 
@@ -14,15 +22,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/lanescape/runners/emulators/fault"
 	ghemu "github.com/lanescape/runners/emulators/github"
+	"github.com/lanescape/runners/emulators/service"
 	"github.com/lanescape/runners/endpoints"
 
 	"github.com/lanescape/actions/internal/selector"
@@ -30,12 +41,12 @@ import (
 )
 
 const (
-	serviceAppID = 77
-	bootstrap    = "lanescape/app/.github/workflows/bootstrap.yml@refs/heads/main"
-	runnersJSON  = `{
+	bootstrap   = "lanescape/app/.github/workflows/bootstrap.yml@refs/heads/main"
+	runnersJSON = `{
   "lanescape-80vcpu-linux-amd64": "ubuntu-24.04",
   "lanescape-2vcpu-linux-arm64": ["ubuntu-24.04-arm"],
-  "bootstrap": "` + bootstrap + `"
+  "bootstrap": "` + bootstrap + `",
+  "branches": {"support/v1": "v1"}
 }`
 	disksInput = `{"build": {"runner": "lanescape-80vcpu-linux-amd64", "spot": true, "from": ["deps/versions.json", "rust-toolchain.toml"]},
   "cache": {"runner": "lanescape-2vcpu-linux-arm64"}}`
@@ -43,8 +54,8 @@ const (
 
 // bins are the programs, built once.
 var bins struct {
-	dir                        string
-	runners, checkout, harness string
+	dir               string
+	runners, checkout string
 }
 
 func TestMain(m *testing.M) {
@@ -65,23 +76,19 @@ func buildAndRun(m *testing.M) (int, error) {
 	bins.dir = dir
 	bins.runners = filepath.Join(dir, "runners")
 	bins.checkout = filepath.Join(dir, "checkout")
-	bins.harness = filepath.Join(dir, "servicetest")
-	build := func(wd string, args ...string) error {
-		cmd := exec.Command("go", append([]string{"build", "-trimpath"}, args...)...)
-		cmd.Dir = wd
+	build := func(args ...string) error {
+		cmd := exec.Command("go", append([]string{"build", "-trimpath", "-tags", "e2e"}, args...)...)
+		cmd.Dir = ".."
 		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOWORK=off", "GOFLAGS=")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("go build %v: %v\n%s", args, err, out)
 		}
 		return nil
 	}
-	if err := build("..", "-tags", "e2e", "-o", bins.runners, "./runners"); err != nil {
+	if err := build("-o", bins.runners, "./runners"); err != nil {
 		return 0, err
 	}
-	if err := build("..", "-tags", "e2e", "-o", bins.checkout, "./checkout"); err != nil {
-		return 0, err
-	}
-	if err := build("../servicetest", "-o", bins.harness, "."); err != nil {
+	if err := build("-o", bins.checkout, "./checkout"); err != nil {
 		return 0, err
 	}
 	return m.Run(), nil
@@ -90,68 +97,162 @@ func buildAndRun(m *testing.M) (int, error) {
 type world struct {
 	t           *testing.T
 	gh          *testgithub.GitHub
+	svc         *service.Emulator
 	org         *ghemu.Account
 	repo        *ghemu.Repo
+	srepo       service.Repository
 	member      *ghemu.Account
 	contributor *ghemu.Account
-	fork        *ghemu.Repo
-	service     string
 }
 
 // newWorld starts the GitHub emulator, with the organization by its real
-// ID and a repository, and the service against it.
+// ID and a repository, and the service emulator, which checks jobs' tokens
+// against the GitHub emulator's OIDC issuer and knows the same repository.
 func newWorld(t *testing.T) *world {
 	t.Helper()
 	if testing.Short() {
-		t.Skip("end-to-end tests run the service")
+		t.Skip("end-to-end tests run the service emulator and the built programs")
 	}
 	gh := testgithub.New(t)
+	svc := service.New(service.WithIssuer(gh.Actions))
+	t.Cleanup(svc.Close)
+	if svc.Organization() != endpoints.Organization {
+		t.Fatalf("the service emulator serves %d, not the organization", svc.Organization())
+	}
 	org := gh.Org(endpoints.Organization, "lanescape")
 	gh.SetForkApproval(org, ghemu.ApproveAllExternalContributors)
-	app := gh.NewApp(serviceAppID)
-	gh.Install(app, org)
-	repo := gh.Repo(org, 5001, "app")
+	srepo := svc.Repository("app")
+	if srepo.Name != "lanescape/app" || svc.Bootstrap(srepo) != bootstrap {
+		t.Fatalf("the service emulator's repository is %s, its bootstrap %s", srepo.Name, svc.Bootstrap(srepo))
+	}
+	repo := gh.Repo(org, srepo.ID, "app")
 	repo.Commit("main", map[string]string{
 		".github/runners.json": runnersJSON,
 		"deps/versions.json":   "café 1.0\n",
 		"rust-toolchain.toml":  "\n",
 	})
+	svc.SetRunners(srepo, runnersJSON)
 	member := gh.User(8001, "member")
 	contributor := gh.User(9001, "contributor")
-	fork := gh.Fork(repo, contributor, 7001)
+	return &world{t: t, gh: gh, svc: svc, org: org, repo: repo, srepo: srepo, member: member, contributor: contributor}
+}
 
-	dir := t.TempDir()
-	keyFile := filepath.Join(dir, "app.pem")
-	if err := os.WriteFile(keyFile, app.PrivateKeyPEM(), 0o600); err != nil {
-		t.Fatal(err)
+// push is a push to a branch, as GitHub and the service see it.
+func (w *world) push(branch string) (*ghemu.Run, service.Run) {
+	return w.gh.PushRun(w.repo, branch), w.svc.Push(w.srepo, branch)
+}
+
+// job starts a job of a run on one of GitHub's own runners, as the service
+// sees it; workflowRef is its job_workflow_ref, or empty for the run's own
+// workflow's.
+func (w *world) job(run service.Run, workflowRef string) *service.Job {
+	j := w.svc.StartJob(run, workflowRef)
+	return &j
+}
+
+// pullRequest opens a pull request into main from a new branch, head, of
+// the repository, with files changed.
+func (w *world) pullRequest(head string, files map[string]string) (*ghemu.Pull, service.PullRequest) {
+	w.t.Helper()
+	w.repo.Commit(head, files)
+	pr := w.gh.PullRequest(w.repo, "main", w.repo, head, w.member)
+	spr := w.svc.PullRequest(w.srepo, "main", head)
+	w.sameNumber(pr, spr)
+	return pr, spr
+}
+
+// forkPullRequest opens a pull request into main from the contributor's
+// fork, from its branch head with files changed. The service emulator
+// makes the fork, so GitHub's has its ID.
+func (w *world) forkPullRequest(head string, files map[string]string) (*ghemu.Repo, *ghemu.Pull, service.PullRequest) {
+	w.t.Helper()
+	spr := w.svc.ForkPullRequest(w.srepo, "main")
+	fork := w.gh.Fork(w.repo, w.contributor, spr.HeadRepositoryID)
+	fork.Commit(head, files)
+	pr := w.gh.PullRequest(w.repo, "main", fork, head, w.contributor)
+	w.sameNumber(pr, spr)
+	w.sameHead(pr, spr)
+	return fork, pr, spr
+}
+
+func (w *world) sameNumber(pr *ghemu.Pull, spr service.PullRequest) {
+	w.t.Helper()
+	if pr.Number != spr.Number {
+		w.t.Fatalf("GitHub numbered the pull request %d, and the service emulator %d", pr.Number, spr.Number)
 	}
-	addr := filepath.Join(dir, "address")
-	var logs bytes.Buffer
-	cmd := exec.Command(bins.harness, "-github", gh.URL, "-app-id", strconv.Itoa(serviceAppID), "-app-key", keyFile,
-		"-issuer", gh.Actions.URL, "-jwks", gh.Actions.JWKSURL, "-address-file", addr)
-	cmd.Stdout, cmd.Stderr = &logs, &logs
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		if t.Failed() {
-			t.Logf("the service's log:\n%s", logs.String())
-		}
+}
+
+// bindRequest is a bootstrap's body (specs/0005-interface.md, Binding a
+// run).
+type bindRequest struct {
+	PullRequest      int    `json:"pull_request"`
+	HeadRepositoryID int64  `json:"head_repository_id"`
+	HeadSHA          string `json:"head_sha"`
+}
+
+// sameHead lets the service emulator know a fork's pull request's head
+// commit by the name GitHub's emulator gives it now. The two emulators each
+// make their own commits, and the service emulator's World takes none of
+// GitHub's, so a binding request that names exactly this pull request, its
+// head repository and that commit reaches the emulator naming the
+// emulator's own head commit instead. Any other request, such as one that
+// names a later head or has anything else in it, reaches it as it was
+// sent.
+func (w *world) sameHead(pr *ghemu.Pull, spr service.PullRequest) {
+	want := bindRequest{PullRequest: pr.Number, HeadRepositoryID: pr.Head.ID, HeadSHA: pr.HeadSHA}
+	renamed := want
+	renamed.HeadSHA = spr.HeadSHA
+	target := w.svc.URL() + "/v1/bind"
+	w.svc.Faults().Add(fault.Rule{
+		Method:     http.MethodPost,
+		PathPrefix: "/v1/bind",
+		Match: func(r *http.Request) bool {
+			if r.URL.Path != "/v1/bind" {
+				return false
+			}
+			body, err := io.ReadAll(r.Body)
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			if err != nil {
+				return false
+			}
+			dec := json.NewDecoder(bytes.NewReader(body))
+			dec.DisallowUnknownFields()
+			var got bindRequest
+			return dec.Decode(&got) == nil && dec.Decode(&struct{}{}) == io.EOF && got == want
+		},
+		Respond: func(rw http.ResponseWriter, r *http.Request) {
+			body, _ := json.Marshal(renamed)
+			req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(body))
+			if err != nil {
+				http.Error(rw, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			for _, h := range []string{"Authorization", "Content-Type"} {
+				if v := r.Header.Get(h); v != "" {
+					req.Header.Set(h, v)
+				}
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				http.Error(rw, err.Error(), http.StatusBadGateway)
+				return
+			}
+			defer resp.Body.Close()
+			for k, vs := range resp.Header {
+				rw.Header()[k] = vs
+			}
+			rw.WriteHeader(resp.StatusCode)
+			_, _ = io.Copy(rw, resp.Body)
+		},
 	})
-	var service string
-	for deadline := time.Now().Add(30 * time.Second); service == ""; {
-		if b, err := os.ReadFile(addr); err == nil && strings.HasSuffix(string(b), "\n") {
-			service = strings.TrimSpace(string(b))
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the service didn't start:\n%s", logs.String())
-		}
-		time.Sleep(20 * time.Millisecond)
+}
+
+// bound checks the run's binding as the service emulator holds it.
+func (w *world) bound(run service.Run, want string) {
+	w.t.Helper()
+	if got, ok := w.svc.Binding(run); !ok || got != want {
+		w.t.Fatalf("the service bound %q (%v), not %q", got, ok, want)
 	}
-	return &world{t: t, gh: gh, org: org, repo: repo, member: member, contributor: contributor, fork: fork, service: service}
 }
 
 // result is what a step left.
@@ -162,12 +263,18 @@ type result struct {
 	summary string
 }
 
-// step runs a program as a step of job, as GitHub would.
-func (w *world) step(bin string, j testgithub.Job, args ...string) result {
+// step runs a program as a step of job, as GitHub would. sj, if not nil,
+// is the same job as the service emulator knows it, which then mints the
+// job's OIDC tokens, with the audience the program asks for.
+func (w *world) step(bin string, j testgithub.Job, sj *service.Job, args ...string) result {
 	w.t.Helper()
+	if sj != nil {
+		job := *sj
+		j.OIDC = func(audience string) string { return w.svc.Token(job, map[string]any{"aud": audience}) }
+	}
 	env := w.gh.Env(j)
 	cmd := exec.Command(bin, args...)
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "LANESCAPE_TEST_SERVICE=" + w.service}
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "LANESCAPE_TEST_SERVICE=" + w.svc.URL()}
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
@@ -219,8 +326,8 @@ func expectMap(t *testing.T, got map[string]any, want map[string]any) {
 
 func TestAPushToMainBindsMain(t *testing.T) {
 	w := newWorld(t)
-	run := w.gh.PushRun(w.repo, "main")
-	r := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true, Inputs: map[string]string{"disks": disksInput}})
+	run, srun := w.push("main")
+	r := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true, Inputs: map[string]string{"disks": disksInput}}, w.job(srun, ""))
 	k := key("build", "lanescape-80vcpu-linux-amd64", "deps/versions.json", "café 1.0\n", "rust-toolchain.toml", "\n")
 	expectMap(t, r.runnersMap(t), map[string]any{
 		"build":                        "lanescape-80vcpu-linux-amd64-spot-disk-build-" + k + "-main",
@@ -231,23 +338,45 @@ func TestAPushToMainBindsMain(t *testing.T) {
 	if !strings.Contains(r.summary, "Inside the lanescape organization") || !strings.Contains(r.summary, "scope is `main`") {
 		t.Fatalf("summary = %s", r.summary)
 	}
+	w.bound(srun, "main")
 	// The token's audience is the service.
-	if a := w.gh.Audiences; len(a) != 1 || a[0] != w.service {
+	if a := w.gh.Audiences; len(a) != 1 || a[0] != w.svc.URL() {
 		t.Fatalf("audiences = %v", a)
 	}
 	// Binding again, as a rerun's first job does, gives the same binding.
-	again := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true, Inputs: map[string]string{"disks": disksInput}})
+	w.gh.Rerun(run)
+	srun = w.svc.Rerun(srun)
+	again := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true, Inputs: map[string]string{"disks": disksInput}}, w.job(srun, ""))
 	if again.outputs["map"] != r.outputs["map"] {
 		t.Fatalf("rebinding gave %s", again.outputs["map"])
 	}
 }
 
+func TestAPushToAListedBranchBindsItsScope(t *testing.T) {
+	w := newWorld(t)
+	w.repo.Commit("support/v1", map[string]string{"deps/versions.json": "café 0.9\n"})
+	w.svc.Branch(w.srepo, "support/v1")
+	run, srun := w.push("support/v1")
+	r := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true, Inputs: map[string]string{"disks": disksInput}}, w.job(srun, ""))
+	// The files are read at the branch's commit.
+	k := key("build", "lanescape-80vcpu-linux-amd64", "deps/versions.json", "café 0.9\n", "rust-toolchain.toml", "\n")
+	expectMap(t, r.runnersMap(t), map[string]any{
+		"build":                        "lanescape-80vcpu-linux-amd64-spot-disk-build-" + k + "-branch-v1",
+		"cache":                        "lanescape-2vcpu-linux-arm64-disk-cache-00000000000000000000-branch-v1",
+		"lanescape-2vcpu-linux-arm64":  "lanescape-2vcpu-linux-arm64-branch-v1",
+		"lanescape-80vcpu-linux-amd64": "lanescape-80vcpu-linux-amd64-branch-v1",
+	})
+	if !strings.Contains(r.summary, "scope is `branch-v1`") {
+		t.Fatalf("summary = %s", r.summary)
+	}
+	w.bound(srun, "branch-v1")
+}
+
 func TestAPullRequestsRunBindsItsScopeAndKeys(t *testing.T) {
 	w := newWorld(t)
-	w.repo.Commit("deps", map[string]string{"deps/versions.json": "café 2.0\n"})
-	pr := w.gh.PullRequest(w.repo, "main", w.repo, "deps", w.member)
-	run := w.gh.PullRequestRun(pr)
-	r := w.step(bins.runners, testgithub.Job{Run: run, Pull: pr, IDToken: true, Inputs: map[string]string{"disks": disksInput}})
+	pr, spr := w.pullRequest("deps", map[string]string{"deps/versions.json": "café 2.0\n"})
+	run, srun := w.gh.PullRequestRun(pr), w.svc.PullRequestRun(spr)
+	r := w.step(bins.runners, testgithub.Job{Run: run, Pull: pr, IDToken: true, Inputs: map[string]string{"disks": disksInput}}, w.job(srun, ""))
 	scope := fmt.Sprintf("pr%d", pr.Number)
 	// The files are read at the run's commit, so the key is the pull
 	// request's, beside main's rather than over it.
@@ -262,15 +391,17 @@ func TestAPullRequestsRunBindsItsScopeAndKeys(t *testing.T) {
 		"lanescape-2vcpu-linux-arm64":  "lanescape-2vcpu-linux-arm64-" + scope,
 		"lanescape-80vcpu-linux-amd64": "lanescape-80vcpu-linux-amd64-" + scope,
 	})
+	w.bound(srun, scope)
 }
 
 func TestAForksRunFallsBack(t *testing.T) {
 	w := newWorld(t)
-	run := w.gh.PushRun(w.fork, "main")
+	fork := w.gh.Fork(w.repo, w.contributor, 7001)
+	run := w.gh.PushRun(fork, "main")
 	r := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true, Inputs: map[string]string{
 		"disks":     disksInput,
 		"fallbacks": `{"lanescape-2vcpu-linux-arm64": ["self-hosted", "arm64"]}`,
-	}})
+	}}, nil)
 	expectMap(t, r.runnersMap(t), map[string]any{
 		"build":                        "ubuntu-24.04",
 		"cache":                        []any{"self-hosted", "arm64"},
@@ -287,23 +418,25 @@ func TestAForksRunFallsBack(t *testing.T) {
 
 func TestAForksPullRequestIntoTheOrganizationFallsBack(t *testing.T) {
 	w := newWorld(t)
-	w.fork.Commit("change", map[string]string{".github/runners.json": `{"lanescape-80vcpu-linux-amd64": "ubuntu-26.04"}`})
-	pr := w.gh.PullRequest(w.repo, "main", w.fork, "change", w.contributor)
-	run := w.gh.PullRequestRun(pr)
+	_, pr, spr := w.forkPullRequest("change", map[string]string{".github/runners.json": `{"lanescape-80vcpu-linux-amd64": "ubuntu-26.04"}`})
+	run, srun := w.gh.PullRequestRun(pr), w.svc.PullRequestRun(spr)
 	r := w.step(bins.runners, testgithub.Job{Run: run, Pull: pr, IDToken: true, Inputs: map[string]string{
 		"fallbacks": `{"lanescape-80vcpu-linux-amd64": "organization-runner"}`,
-	}})
+	}}, w.job(srun, ""))
 	// The run's commit is the merge of the fork's change, whose file it
 	// reads; the organization's RUNNERS is ignored.
 	expectMap(t, r.runnersMap(t), map[string]any{"lanescape-80vcpu-linux-amd64": "ubuntu-26.04"})
 	if len(w.gh.Audiences) != 0 {
 		t.Fatal("a fork's pull request asked for a token for the service")
 	}
+	if _, ok := w.svc.Binding(srun); ok {
+		t.Fatal("a fork's pull request bound its run")
+	}
 	if !strings.Contains(r.summary, "a fork's pull request") {
 		t.Fatalf("summary = %s", r.summary)
 	}
 	// Its checkout is the run's own commit, as actions/checkout's.
-	c := w.step(bins.checkout, testgithub.Job{Run: run, Pull: pr}, "decide")
+	c := w.step(bins.checkout, testgithub.Job{Run: run, Pull: pr}, nil, "decide")
 	if c.err != nil || c.outputs["repository"] != "" || c.outputs["ref"] != "" || c.outputs["persist-credentials"] != "true" {
 		t.Fatalf("checkout = %v %v\n%s", c.err, c.outputs, c.log)
 	}
@@ -311,19 +444,20 @@ func TestAForksPullRequestIntoTheOrganizationFallsBack(t *testing.T) {
 
 func TestAnApprovedContribution(t *testing.T) {
 	w := newWorld(t)
-	head := w.fork.Commit("change", map[string]string{"deps/versions.json": "café 3.0\n", ".github/runners.json": `{"lanescape-2vcpu-linux-amd64": "x"}`})
-	pr := w.gh.PullRequest(w.repo, "main", w.fork, "change", w.contributor)
-	run := w.gh.PullRequestTargetRun(pr)
+	fork, pr, spr := w.forkPullRequest("change", map[string]string{"deps/versions.json": "café 3.0\n", ".github/runners.json": `{"lanescape-2vcpu-linux-amd64": "x"}`})
+	head := pr.HeadSHA
+	run, srun := w.gh.PullRequestTargetRun(pr), w.svc.PullRequestTargetRun(spr)
 	// The contributor pushes again once the run was approved: its jobs
-	// still build the commit it was approved for.
-	w.fork.Commit("change", map[string]string{"deps/versions.json": "café 4.0\n"})
+	// still build the commit it was approved for. The push is GitHub's
+	// alone, since the service learns the head from the bootstrap.
+	fork.Commit("change", map[string]string{"deps/versions.json": "café 4.0\n"})
 	w.gh.Sync(pr)
 	if pr.HeadSHA == head {
 		t.Fatal("the pull request didn't move")
 	}
 	// The bootstrap workflow's job binds the contribution's scope.
-	r := w.step(bins.runners, testgithub.Job{Run: run, Pull: pr, IDToken: true, Claims: ghemu.Job{WorkflowRef: bootstrap},
-		Inputs: map[string]string{"disks": disksInput}})
+	r := w.step(bins.runners, testgithub.Job{Run: run, Pull: pr, IDToken: true, Inputs: map[string]string{"disks": disksInput}},
+		w.job(srun, w.svc.Bootstrap(w.srepo)))
 	scope := fmt.Sprintf("pr%d", pr.Number)
 	// runners.json is the default branch's; the disks' files are the
 	// contribution's.
@@ -334,8 +468,9 @@ func TestAnApprovedContribution(t *testing.T) {
 		"lanescape-2vcpu-linux-arm64":  "lanescape-2vcpu-linux-arm64-" + scope,
 		"lanescape-80vcpu-linux-amd64": "lanescape-80vcpu-linux-amd64-" + scope,
 	})
+	w.bound(srun, scope)
 	// The contribution's jobs check out exactly its head.
-	c := w.step(bins.checkout, testgithub.Job{Run: run, Pull: pr, Inputs: map[string]string{"contribution": "true"}}, "decide")
+	c := w.step(bins.checkout, testgithub.Job{Run: run, Pull: pr, Inputs: map[string]string{"contribution": "true"}}, nil, "decide")
 	if c.err != nil {
 		t.Fatalf("checkout: %v\n%s", c.err, c.log)
 	}
@@ -351,58 +486,66 @@ func TestAnApprovedContribution(t *testing.T) {
 // the action gets the read scope.
 func TestAPullRequestTargetRunOutsideTheBootstrapReads(t *testing.T) {
 	w := newWorld(t)
-	w.fork.Commit("change", map[string]string{"a": "1"})
-	pr := w.gh.PullRequest(w.repo, "main", w.fork, "change", w.contributor)
-	run := w.gh.PullRequestTargetRun(pr)
-	r := w.step(bins.runners, testgithub.Job{Run: run, Pull: pr, IDToken: true})
+	_, pr, spr := w.forkPullRequest("change", map[string]string{"a": "1"})
+	run, srun := w.gh.PullRequestTargetRun(pr), w.svc.PullRequestTargetRun(spr)
+	r := w.step(bins.runners, testgithub.Job{Run: run, Pull: pr, IDToken: true}, w.job(srun, ""))
 	expectMap(t, r.runnersMap(t), map[string]any{
 		"lanescape-2vcpu-linux-arm64":  "lanescape-2vcpu-linux-arm64-read",
 		"lanescape-80vcpu-linux-amd64": "lanescape-80vcpu-linux-amd64-read",
 	})
+	w.bound(srun, "read")
 }
 
 func TestTheServiceRetriesWhileGitHubCantBeReached(t *testing.T) {
 	w := newWorld(t)
-	run := w.gh.PushRun(w.repo, "main")
-	// The service's reads of the repository fail, and the service asks
-	// the action to try again.
-	w.gh.ServerError("/repositories/", 503, 3)
-	r := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true})
+	run, srun := w.push("main")
+	// GitHub can't be reached for the service's first three answers,
+	// which ask the action to try again, as the service's do.
+	w.svc.Faults().Add(fault.Rule{Method: http.MethodPost, PathPrefix: "/v1/bind", Times: 3, Respond: service.Unavailable(time.Second)})
+	r := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true}, w.job(srun, ""))
 	expectMap(t, r.runnersMap(t), map[string]any{
 		"lanescape-2vcpu-linux-arm64":  "lanescape-2vcpu-linux-arm64-main",
 		"lanescape-80vcpu-linux-amd64": "lanescape-80vcpu-linux-amd64-main",
 	})
-	if !strings.Contains(r.log, "trying again") || len(w.gh.Audiences) < 2 {
+	// Each attempt gets a token afresh.
+	if !strings.Contains(r.log, "trying again") || len(w.gh.Audiences) != 4 {
 		t.Fatalf("no retry: %d tokens\n%s", len(w.gh.Audiences), r.log)
 	}
+	w.bound(srun, "main")
 }
 
 func TestTheActionFailsOnceItsRetriesAreSpent(t *testing.T) {
 	w := newWorld(t)
-	run := w.gh.PushRun(w.repo, "main")
-	w.gh.ServerError("/repositories/", 503, 1000)
-	r := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true})
+	run, srun := w.push("main")
+	w.svc.Unavailable(true)
+	r := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true}, w.job(srun, ""))
 	if r.err == nil || !strings.Contains(r.log, "retries are spent") || r.outputs["map"] != "" {
 		t.Fatalf("err = %v, outputs %v\n%s", r.err, r.outputs, r.log)
+	}
+	if _, ok := w.svc.Binding(srun); ok {
+		t.Fatal("the run was bound while GitHub couldn't be reached")
 	}
 }
 
 func TestARefusedBindingFailsWithItsReason(t *testing.T) {
 	w := newWorld(t)
-	run := w.gh.PushRun(w.repo, "main")
+	run, srun := w.push("main")
+	// The run's one job has finished, so GitHub shows the run completed.
+	j := w.job(srun, "")
+	w.svc.FinishJob(*j, "success")
 	w.gh.SetRunStatus(run, "completed")
-	r := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true})
-	if r.err == nil || !strings.Contains(r.log, "refused to bind the run") || !strings.Contains(r.log, "not in progress") {
+	r := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true}, j)
+	if r.err == nil || !strings.Contains(r.log, "refused to bind the run") || !strings.Contains(r.log, "the run isn't in progress") {
 		t.Fatalf("err = %v\n%s", r.err, r.log)
 	}
 }
 
 func TestAMissingListedFileFailsNamingIt(t *testing.T) {
 	w := newWorld(t)
-	run := w.gh.PushRun(w.repo, "main")
+	run, srun := w.push("main")
 	r := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true, Inputs: map[string]string{
 		"disks": `{"build": {"runner": "lanescape-80vcpu-linux-amd64", "from": ["deps/missing.json"]}}`,
-	}})
+	}}, w.job(srun, ""))
 	if r.err == nil || !strings.Contains(r.log, "deps/missing.json isn't in lanescape/app") {
 		t.Fatalf("err = %v\n%s", r.err, r.log)
 	}
@@ -410,8 +553,8 @@ func TestAMissingListedFileFailsNamingIt(t *testing.T) {
 
 func TestCheckoutRefusesAContributionOutsidePullRequestTarget(t *testing.T) {
 	w := newWorld(t)
-	run := w.gh.PushRun(w.repo, "main")
-	r := w.step(bins.checkout, testgithub.Job{Run: run, Inputs: map[string]string{"contribution": "true"}}, "decide")
+	run, _ := w.push("main")
+	r := w.step(bins.checkout, testgithub.Job{Run: run, Inputs: map[string]string{"contribution": "true"}}, nil, "decide")
 	if r.err == nil || !strings.Contains(r.log, "only in a pull_request_target run") || len(r.outputs) != 0 {
 		t.Fatalf("err = %v, outputs %v\n%s", r.err, r.outputs, r.log)
 	}

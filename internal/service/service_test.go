@@ -2,7 +2,8 @@ package service
 
 // These tests check how the client reads each answer the interface has,
 // and some it doesn't, from a handler that gives them on cue. The
-// end-to-end tests (e2e/) bind against the real service.
+// end-to-end tests (e2e/) bind against lanescape/runners' emulator of the
+// service.
 
 import (
 	"context"
@@ -88,6 +89,15 @@ func TestBind(t *testing.T) {
 	}
 }
 
+func TestBindAListedBranchsScope(t *testing.T) {
+	srv, _, _ := cue(t, answer{200, `{"scope": "branch-v1"}`, ""})
+	var waits []time.Duration
+	scope, err := client(srv.URL, &tokens{}, &waits).Bind(context.Background(), nil)
+	if err != nil || scope != "branch-v1" {
+		t.Fatalf("scope = %q, %v", scope, err)
+	}
+}
+
 func TestBindSendsTheContribution(t *testing.T) {
 	srv, bodies, _ := cue(t, answer{200, `{"scope": "pr7"}`, ""})
 	var waits []time.Duration
@@ -142,11 +152,12 @@ func TestBindFailsOnceRetriesAreSpent(t *testing.T) {
 
 func TestBindRefusesAnswersOutsideTheInterface(t *testing.T) {
 	for name, a := range map[string]answer{
-		"200 without a scope":  {200, `{}`, ""},
-		"200 with a bad scope": {200, `{"scope": "dev"}`, ""},
-		"200 not JSON":         {200, `scope`, ""},
-		"401":                  {401, `{}`, ""},
-		"404":                  {404, `{}`, ""},
+		"200 without a scope":   {200, `{}`, ""},
+		"200 with a bad scope":  {200, `{"scope": "dev"}`, ""},
+		"200 with a bad branch": {200, `{"scope": "branch-V1"}`, ""},
+		"200 not JSON":          {200, `scope`, ""},
+		"401":                   {401, `{}`, ""},
+		"404":                   {404, `{}`, ""},
 	} {
 		srv, bodies, _ := cue(t, a)
 		var waits []time.Duration

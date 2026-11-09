@@ -1,7 +1,8 @@
 // Package testgithub is what the tests need of lanescape/runners' GitHub
 // emulator beyond the emulator itself: the jobs' tokens, as GitHub gives a
-// job its GITHUB_TOKEN and, with id-token: write, its OIDC tokens. It's
-// for tests only.
+// job its GITHUB_TOKEN and, with id-token: write, its OIDC tokens, which a
+// test may have another of that repository's emulators mint, such as its
+// service emulator for a job it knows. It's for tests only.
 package testgithub
 
 import (
@@ -51,8 +52,9 @@ type GitHub struct {
 }
 
 type job struct {
-	run *ghemu.Run
-	job ghemu.Job
+	run  *ghemu.Run
+	job  ghemu.Job
+	mint func(audience string) string
 }
 
 // New starts an emulator, closed when the test ends.
@@ -124,12 +126,23 @@ func (g *GitHub) Secrets() []string {
 // RequestToken is ACTIONS_ID_TOKEN_REQUEST_TOKEN for a job of run: the
 // tokens got with it are j's, with the audience asked for.
 func (g *GitHub) RequestToken(run *ghemu.Run, j ghemu.Job) string {
+	return g.requestToken(job{run: run, job: j})
+}
+
+// RequestTokenFrom is ACTIONS_ID_TOKEN_REQUEST_TOKEN for a job whose
+// tokens mint makes, given the audience asked for, or GitHub's default,
+// https://github.com/<owner>, if none was.
+func (g *GitHub) RequestTokenFrom(run *ghemu.Run, mint func(audience string) string) string {
+	return g.requestToken(job{run: run, mint: mint})
+}
+
+func (g *GitHub) requestToken(j job) string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
 	tok := hex.EncodeToString(b[:])
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.requests[tok] = job{run: run, job: j}
+	g.requests[tok] = j
 	g.Minted = append(g.Minted, tok)
 	return tok
 }
@@ -148,11 +161,19 @@ func (g *GitHub) token(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"message":"Bad credentials"}`, http.StatusUnauthorized)
 		return
 	}
-	jj := j.job
-	if aud != "" {
-		jj.Audience = aud
+	var tok string
+	if j.mint != nil {
+		if aud == "" {
+			aud = "https://github.com/" + j.run.Repo.Owner.Login
+		}
+		tok = j.mint(aud)
+	} else {
+		jj := j.job
+		if aud != "" {
+			jj.Audience = aud
+		}
+		tok = g.ActionsToken(j.run, jj, nil)
 	}
-	tok := g.ActionsToken(j.run, jj, nil)
 	g.mu.Lock()
 	g.Minted = append(g.Minted, tok)
 	g.mu.Unlock()
@@ -178,6 +199,9 @@ type Job struct {
 	// Claims is what tells the job's OIDC tokens from others in the run,
 	// such as a bootstrap workflow's job_workflow_ref.
 	Claims ghemu.Job
+	// OIDC, if set, mints the job's OIDC tokens in place of the GitHub
+	// emulator, given the audience asked for; Claims is then unused.
+	OIDC func(audience string) string
 	// IDToken is whether the job has id-token: write.
 	IDToken bool
 	// Inputs are the action's inputs, as INPUT_<NAME>. The token input is
@@ -238,7 +262,11 @@ func (g *GitHub) Env(j Job) map[string]string {
 	}
 	if j.IDToken {
 		env["ACTIONS_ID_TOKEN_REQUEST_URL"] = g.TokenURL
-		env["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = g.RequestToken(run, j.Claims)
+		if j.OIDC != nil {
+			env["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = g.RequestTokenFrom(run, j.OIDC)
+		} else {
+			env["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = g.RequestToken(run, j.Claims)
+		}
 	}
 	for k, v := range j.Inputs {
 		env["INPUT_"+strings.ToUpper(strings.ReplaceAll(k, "-", "_"))] = v

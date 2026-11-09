@@ -19,9 +19,12 @@ import (
 // Path is the file's path in the repository.
 const Path = ".github/runners.json"
 
-// BootstrapKey is the entry naming the bootstrap workflow, which is no
-// runner.
-const BootstrapKey = "bootstrap"
+// BootstrapKey is the entry naming the bootstrap workflow, and
+// BranchesKey the one listing long-lived branches; neither is a runner.
+const (
+	BootstrapKey = "bootstrap"
+	BranchesKey  = "branches"
+)
 
 // Labels is a fallback: one label, or a list of them, as written.
 type Labels struct {
@@ -84,6 +87,9 @@ type File struct {
 	Fallbacks map[string]Labels
 	// Bootstrap is the bootstrap workflow's reference, if named.
 	Bootstrap string
+	// Branches are the long-lived branches listed, each with the name of
+	// its scope, branch-<name>.
+	Branches map[string]string
 }
 
 // Names are the file's runner names, sorted.
@@ -98,7 +104,8 @@ func (f File) Names() []string {
 
 // Parse reads the file: an object from each runner name, a shape such as
 // lanescape-80vcpu-linux-amd64, to its fallback; and optionally
-// "bootstrap", a string.
+// "bootstrap", a string, and "branches", an object from each long-lived
+// branch's name to its scope's, which no two branches share.
 func Parse(data []byte) (File, error) {
 	raw, err := object(data)
 	if err != nil {
@@ -110,6 +117,13 @@ func Parse(data []byte) (File, error) {
 		if name == BootstrapKey {
 			if err := json.Unmarshal(v, &f.Bootstrap); err != nil || f.Bootstrap == "" {
 				errs = append(errs, fmt.Errorf("%s: bootstrap must be a workflow reference", Path))
+			}
+			continue
+		}
+		if name == BranchesKey {
+			f.Branches, err = branches(v)
+			if err != nil {
+				errs = append(errs, err)
 			}
 			continue
 		}
@@ -131,6 +145,38 @@ func Parse(data []byte) (File, error) {
 		return File{}, fmt.Errorf("%s names no runners", Path)
 	}
 	return f, nil
+}
+
+// branches reads "branches": an object from each branch's name to the
+// name of its scope, 1 to 16 lowercase letters and digits, starting with a
+// letter, which no other branch's shares.
+func branches(v json.RawMessage) (map[string]string, error) {
+	raw, err := object(v)
+	if err != nil {
+		return nil, fmt.Errorf("%s: branches %w", Path, err)
+	}
+	out := map[string]string{}
+	byName := map[string]string{}
+	var errs []error
+	for branch, rv := range raw {
+		var name string
+		switch {
+		case branch == "":
+			errs = append(errs, fmt.Errorf("%s: branches: a branch's name is empty", Path))
+		case json.Unmarshal(rv, &name) != nil || !selector.ScopeName.MatchString(name):
+			errs = append(errs, fmt.Errorf("%s: branches: %s's scope must be named by 1 to 16 lowercase letters and digits, starting with a letter", Path, branch))
+		case byName[name] != "":
+			first, second := byName[name], branch
+			if second < first {
+				first, second = second, first
+			}
+			errs = append(errs, fmt.Errorf("%s: branches: %s and %s both name the scope %s", Path, first, second, name))
+		default:
+			byName[name] = branch
+			out[branch] = name
+		}
+	}
+	return out, errors.Join(errs...)
 }
 
 // ParseOverrides reads the RUNNERS variable: an object in the file's shape,
