@@ -2,7 +2,7 @@
 
 Read the applicable specifications in `specs/` before editing, and keep them, the code and the tests in step.
 
-These actions run inside consumers' own jobs. They rely on nothing of `lanescape/runners` but its interface for actions, its spec 0005, at the version `go.mod` names. Outside the organization they degrade as specs/0001-actions.md says, and never call the service. Never log credentials, OIDC tokens or identity tokens.
+These actions run inside consumers' own jobs. They rely on nothing of `lanescape/runners` but its interface for actions, its spec 0005, at the version `go.mod` names. Only `servicetest/`, which runs the service for the tests and is no part of any action, builds from its internal packages, at the same version. Outside the organization they degrade as specs/0001-actions.md says, and never call the service. Never log credentials, OIDC tokens or identity tokens.
 
 Workflows here run on Blacksmith, or GitHub's runners for fork pull requests, never on the runner service's own machines. Use the latest stable GitHub Actions releases, with Node 24 or newer for JavaScript actions. Go is pinned by `go.mod`'s `toolchain` line. Tests use only `lanescape/runners`' own emulators, never anyone else's.
 
