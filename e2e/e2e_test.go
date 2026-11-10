@@ -349,9 +349,25 @@ func TestAFailedBuild(t *testing.T) {
 	if !strings.Contains(r.log, "Unable to locate package gcc") {
 		t.Fatalf("the failed build's log wasn't printed:\n%s", r.log)
 	}
-	// Asked again, the action fails at once with the service's reason.
+	// Asked again in the same attempt, the action fails at once with the
+	// service's reason.
 	j2 := w.machine(run)
 	w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "build"}}, &j2).failed(t, "scripts failed")
+	// A maintainer's rerun asks for a new build, and the action waits for
+	// it.
+	w.gh.Rerun(run)
+	again := w.builds(run, "build")["amd64"]
+	if again == id {
+		t.Fatal("the rerun got the failed build")
+	}
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		w.svc.FinishBuild(w.srepo, again, "built at last\n")
+	}()
+	j3 := w.machine(run)
+	if r := w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "build"}}, &j3).ok(t); !strings.Contains(r.log, "built at last") {
+		t.Fatalf("the rerun's build's log:\n%s", r.log)
+	}
 }
 
 func TestAnImageTheCommitDoesntDeclare(t *testing.T) {

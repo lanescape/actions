@@ -49,6 +49,10 @@ type Client struct {
 	url string
 }
 
+// maxAnswer bounds an answer: a megabyte of a build's log, escaped as JSON
+// may escape it, six bytes for every byte at most, with room to spare.
+const maxAnswer = 8 << 20
+
 // DefaultRetry is how long a request waits for the service: eight attempts
 // in all, the waits doubling from 2 seconds to a minute, or what
 // Retry-After asks if longer, up to a minute.
@@ -132,10 +136,13 @@ func (c *Client) once(ctx context.Context, method, path string, body []byte, out
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	hc := c.HTTP
-	if hc == nil {
-		hc = &http.Client{Timeout: 2 * time.Minute}
+	hc := &http.Client{Timeout: 2 * time.Minute}
+	if c.HTTP != nil {
+		copied := *c.HTTP
+		hc = &copied
 	}
+	// A redirect isn't the interface's answer: it fails as one.
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := hc.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -144,10 +151,16 @@ func (c *Client) once(ctx context.Context, method, path string, body []byte, out
 		return 0, errors.New("the runner service couldn't be reached")
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxAnswer+1))
 	if err != nil {
 		return 0, errors.New("the runner service's answer couldn't be read")
 	}
+	if len(data) > maxAnswer {
+		return 0, final{errors.New("the runner service's answer is larger than any its interface gives")}
+	}
+	// Nothing the service sends back reaches the job's log with the
+	// token in it, whatever it says.
+	data = bytes.ReplaceAll(data, []byte(tok), []byte("***"))
 	var answer struct {
 		Reason    string `json:"reason"`
 		Retryable bool   `json:"retryable"`
@@ -207,7 +220,7 @@ func (c *Client) Image(ctx context.Context, name string) ([]Build, error) {
 	for _, b := range out.Builds {
 		if b.Architecture == "" || b.Version == "" || (b.State != Ready && b.State != Building && b.State != Failed) ||
 			(b.State == Building && b.Build == "") {
-			return nil, fmt.Errorf("the runner service answered with a build its interface doesn't have: %+v", b)
+			return nil, errors.New("the runner service answered with a build its interface doesn't have")
 		}
 	}
 	return out.Builds, nil

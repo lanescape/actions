@@ -59,6 +59,13 @@ func run(ctx context.Context, rt *actions.Runtime, svc *service.Client, machineD
 	}
 	slices.SortFunc(builds, func(a, b service.Build) int { return strings.Compare(a.Architecture, b.Architecture) })
 	offsets := map[string]int64{}
+	// A build already failed fails the action at once, before any other
+	// is followed.
+	for _, b := range builds {
+		if b.State == service.Failed {
+			return fmt.Errorf("the image %s's build for %s failed: %s", image, b.Architecture, b.Reason)
+		}
+	}
 	for {
 		pending := false
 		for i, b := range builds {

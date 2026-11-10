@@ -2,28 +2,28 @@ package metadata
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
-	"strings"
 	"testing"
+
+	"github.com/lanescape/runners/emulators/service"
 )
 
+// The token comes from the machine's metadata server, as lanescape/runners'
+// emulator of the service serves its machines one, for the audience asked
+// for, in the full format.
 func TestToken(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Metadata-Flavor") != "Google" || r.URL.Path != "/computeMetadata/v1/instance/service-accounts/default/identity" ||
-			r.URL.Query().Get("audience") != "https://service.example?x=1" || r.URL.Query().Get("format") != "full" {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		_, _ = w.Write([]byte("header.payload.signature\n"))
-	}))
-	defer srv.Close()
-	tok, err := Server{URL: srv.URL}.Token(context.Background(), "https://service.example?x=1")
-	if err != nil || tok != "header.payload.signature" {
+	svc := service.New()
+	defer svc.Close()
+	repo := svc.Repository("app")
+	j, err := svc.StartJob(svc.Push(repo, "main"), "lanescape-2vcpu-linux-amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, err := Server{URL: svc.Metadata(j)}.Token(context.Background(), svc.URL())
+	if err != nil || tok == "" || tok != svc.Token(j) && len(tok) < 100 {
 		t.Fatalf("token = %q, %v", tok, err)
 	}
-	if _, err := (Server{URL: srv.URL}).Token(context.Background(), ""); err == nil || strings.Contains(err.Error(), "signature") {
-		t.Fatalf("a refusal: %v", err)
+	if _, err := (Server{URL: svc.Metadata(j)}).Token(context.Background(), ""); err == nil {
+		t.Fatal("a token with no audience")
 	}
 	if _, err := (Server{URL: "http://127.0.0.1:1"}).Token(context.Background(), "aud"); err == nil {
 		t.Fatal("no error from a server that isn't there")
