@@ -2,9 +2,9 @@
 // actions, lanescape/runners' specs/0005-interface.md, at the version
 // go.mod names: nothing else of the service's is relied on.
 //
-// Every request carries the job's GitHub OIDC token, whose audience is the
-// service's address, endpoints.Service. Tokens, and what the service
-// answers beyond a scope or a refusal's reason, are never logged.
+// Every request is signed with the machine's identity token, for the
+// service's address, endpoints.Service, got afresh for each request from
+// the machine's metadata server. Tokens are never logged.
 package service
 
 import (
@@ -15,22 +15,23 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/lanescape/runners/endpoints"
 
 	"github.com/lanescape/actions/internal/backoff"
-	"github.com/lanescape/actions/internal/selector"
 )
 
-// Tokens gets the job's OIDC token for an audience.
+// Tokens gets the machine's identity token for an audience.
 type Tokens interface {
 	Token(ctx context.Context, audience string) (string, error)
 }
 
 // Client calls the service.
 type Client struct {
-	// Tokens are the job's.
+	// Tokens are the machine's.
 	Tokens Tokens
 	// HTTP is the client to use; nil means one with a timeout above the
 	// service's own.
@@ -48,15 +49,13 @@ type Client struct {
 	url string
 }
 
-// DefaultRetry is how long a bind waits for GitHub to answer the service:
-// eight attempts, the waits doubling from 2 seconds to a minute, or what
-// Retry-After asks if longer.
+// DefaultRetry is how long a request waits for the service: eight attempts
+// in all, the waits doubling from 2 seconds to a minute, or what
+// Retry-After asks if longer, up to a minute.
 var DefaultRetry = backoff.Policy{Attempts: 8, First: 2 * time.Second, Max: time.Minute}
 
 // New is a client for the service at endpoints.Service.
-func New(tokens Tokens) *Client {
-	return &Client{Tokens: tokens, url: address()}
-}
+func New(tokens Tokens) *Client { return &Client{Tokens: tokens, url: address()} }
 
 // URL is the service's address, which is also its tokens' audience.
 func (c *Client) URL() string {
@@ -69,62 +68,14 @@ func (c *Client) URL() string {
 // At is a client for a service elsewhere, for tests in this module.
 func At(url string, tokens Tokens) *Client { return &Client{Tokens: tokens, url: url} }
 
-// BindRequest is the body a bootstrap workflow sends in a
-// pull_request_target run: what its own event says.
-type BindRequest struct {
-	PullRequest      int    `json:"pull_request"`
-	HeadRepositoryID int64  `json:"head_repository_id"`
-	HeadSHA          string `json:"head_sha"`
-}
-
-// Refused is the service's 403: the token or its run isn't one it binds,
-// or the body isn't a binding request.
+// Refused is the service's 403, with its reason.
 type Refused struct{ Reason string }
 
-func (r *Refused) Error() string { return "the runner service refused to bind the run: " + r.Reason }
+func (r *Refused) Error() string { return "the runner service refused: " + r.Reason }
 
-// ErrUnavailable means the service kept answering that GitHub couldn't
-// confirm the run until the retries were spent.
-var ErrUnavailable = errors.New("the runner service couldn't bind the run, since GitHub couldn't confirm it, and the retries are spent")
-
-// Bind binds the run's scope, or returns the binding it has (POST
-// /v1/bind). req is nil except from a bootstrap workflow in a
-// pull_request_target run.
-func (c *Client) Bind(ctx context.Context, req *BindRequest) (string, error) {
-	var body []byte
-	if req != nil {
-		var err error
-		if body, err = json.Marshal(req); err != nil {
-			return "", err
-		}
-	}
-	p := c.Retry
-	if p.Attempts <= 0 {
-		p = defaultRetry()
-	}
-	var last error
-	for n := 1; ; n++ {
-		scope, asked, err := c.bindOnce(ctx, body)
-		if err == nil {
-			return scope, nil
-		}
-		var refused *Refused
-		if errors.As(err, &refused) || errors.Is(err, errFinal) || ctx.Err() != nil {
-			return "", err
-		}
-		last = err
-		if n >= p.Attempts {
-			return "", fmt.Errorf("%w: %w", ErrUnavailable, last)
-		}
-		wait := p.Wait(n, asked)
-		if c.Logf != nil {
-			c.Logf("The runner service can't bind the run yet (%v); trying again in %s.", err, wait.Round(time.Second))
-		}
-		if err := p.Pause(ctx, wait); err != nil {
-			return "", errors.Join(last, err)
-		}
-	}
-}
+// ErrUnavailable means the service kept answering that it couldn't confirm
+// an answer, or couldn't be reached, until the retries were spent.
+var ErrUnavailable = errors.New("the runner service couldn't answer, and the retries are spent")
 
 // errFinal marks a failure that trying again won't mend.
 var errFinal = errors.New("final")
@@ -133,14 +84,49 @@ type final struct{ error }
 
 func (f final) Unwrap() []error { return []error{f.error, errFinal} }
 
-func (c *Client) bindOnce(ctx context.Context, body []byte) (string, time.Duration, error) {
+// do sends a request, signed afresh each attempt, and decodes a 200's body
+// into out, retrying what the interface says to retry.
+func (c *Client) do(ctx context.Context, method, path string, body []byte, out any) error {
+	p := c.Retry
+	if p.Attempts <= 0 {
+		p = defaultRetry()
+	}
+	var last error
+	for n := 1; ; n++ {
+		asked, err := c.once(ctx, method, path, body, out)
+		if err == nil {
+			return nil
+		}
+		var refused *Refused
+		if errors.As(err, &refused) || errors.Is(err, errFinal) || ctx.Err() != nil {
+			return err
+		}
+		last = err
+		if n >= p.Attempts {
+			return fmt.Errorf("%w: %w", ErrUnavailable, last)
+		}
+		wait := p.Wait(n, asked)
+		if c.Logf != nil {
+			c.Logf("The runner service can't answer yet (%v); trying again in %s.", err, wait.Round(time.Second))
+		}
+		if err := p.Pause(ctx, wait); err != nil {
+			return errors.Join(last, err)
+		}
+	}
+}
+
+func (c *Client) once(ctx context.Context, method, path string, body []byte, out any) (time.Duration, error) {
 	tok, err := c.Tokens.Token(ctx, c.URL())
 	if err != nil {
-		return "", 0, final{err}
+		return 0, final{fmt.Errorf("the machine's identity token: %w", err)}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.URL()+"/v1/bind", bytes.NewReader(body))
+	var r io.Reader
+	if body != nil {
+		r = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.URL()+path, r)
 	if err != nil {
-		return "", 0, final{err}
+		return 0, final{err}
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
 	if body != nil {
@@ -148,45 +134,103 @@ func (c *Client) bindOnce(ctx context.Context, body []byte) (string, time.Durati
 	}
 	hc := c.HTTP
 	if hc == nil {
-		hc = &http.Client{Timeout: time.Minute}
+		hc = &http.Client{Timeout: 2 * time.Minute}
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
-			return "", 0, ctx.Err()
+			return 0, ctx.Err()
 		}
-		return "", 0, errors.New("the runner service couldn't be reached")
+		return 0, errors.New("the runner service couldn't be reached")
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		return "", 0, errors.New("the runner service's answer couldn't be read")
+		return 0, errors.New("the runner service's answer couldn't be read")
 	}
-	var out struct {
-		Scope     string `json:"scope"`
+	var answer struct {
 		Reason    string `json:"reason"`
 		Retryable bool   `json:"retryable"`
 	}
-	jsonErr := json.Unmarshal(data, &out)
+	jsonErr := json.Unmarshal(data, &answer)
 	asked := backoff.RetryAfter(resp.Header, time.Now())
 	switch {
 	case resp.StatusCode == http.StatusOK:
-		if jsonErr != nil || !selector.Scope.MatchString(out.Scope) {
-			return "", 0, final{errors.New("the runner service answered 200 without a scope")}
+		if err := json.Unmarshal(data, out); err != nil {
+			return 0, final{errors.New("the runner service answered 200 with a body that isn't its interface's")}
 		}
-		return out.Scope, 0, nil
+		return 0, nil
 	case resp.StatusCode == http.StatusForbidden:
-		if out.Reason == "" {
-			out.Reason = "it gave no reason"
+		if answer.Reason == "" {
+			answer.Reason = "it gave no reason"
 		}
-		return "", 0, &Refused{Reason: out.Reason}
-	case resp.StatusCode == http.StatusServiceUnavailable && jsonErr == nil && out.Retryable:
-		return "", asked, errors.New("GitHub couldn't confirm the run")
+		return 0, &Refused{Reason: answer.Reason}
+	case resp.StatusCode == http.StatusServiceUnavailable && jsonErr == nil && answer.Retryable:
+		return asked, errors.New("it couldn't confirm an answer")
 	case resp.StatusCode >= 500, resp.StatusCode == http.StatusTooManyRequests:
 		// Not the interface's answer, but what a server in front of it
 		// says when it's busy or restarting.
-		return "", asked, fmt.Errorf("the runner service answered %d", resp.StatusCode)
+		return asked, fmt.Errorf("it answered %d", resp.StatusCode)
 	default:
-		return "", 0, final{fmt.Errorf("the runner service answered %d, which its interface doesn't have", resp.StatusCode)}
+		return 0, final{fmt.Errorf("the runner service answered %d, which its interface doesn't have", resp.StatusCode)}
 	}
+}
+
+// Build is one architecture's state of an image the run asked for.
+type Build struct {
+	Architecture string `json:"architecture"`
+	Version      string `json:"version"`
+	State        string `json:"state"`
+	Build        string `json:"build"`
+	Reason       string `json:"reason"`
+}
+
+// The states of a build.
+const (
+	Ready    = "ready"
+	Building = "building"
+	Failed   = "failed"
+)
+
+// Image asks for an image of the run's commit, by name (POST /v1/images).
+func (c *Client) Image(ctx context.Context, name string) ([]Build, error) {
+	body, _ := json.Marshal(map[string]string{"name": name})
+	var out struct {
+		Builds []Build `json:"builds"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/v1/images", body, &out); err != nil {
+		return nil, err
+	}
+	if len(out.Builds) == 0 {
+		return nil, errors.New("the runner service answered with no builds")
+	}
+	for _, b := range out.Builds {
+		if b.Architecture == "" || b.Version == "" || (b.State != Ready && b.State != Building && b.State != Failed) ||
+			(b.State == Building && b.Build == "") {
+			return nil, fmt.Errorf("the runner service answered with a build its interface doesn't have: %+v", b)
+		}
+	}
+	return out.Builds, nil
+}
+
+// Progress is a build's state, and its log from an offset.
+type Progress struct {
+	State  string `json:"state"`
+	Reason string `json:"reason"`
+	Log    string `json:"log"`
+	Next   int64  `json:"next"`
+}
+
+// Follow is a build's state and its log from offset (GET
+// /v1/images/builds/<id>).
+func (c *Client) Follow(ctx context.Context, build string, offset int64) (Progress, error) {
+	var out Progress
+	path := "/v1/images/builds/" + url.PathEscape(build) + "?offset=" + strconv.FormatInt(offset, 10)
+	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return Progress{}, err
+	}
+	if out.State != Ready && out.State != Building && out.State != Failed || out.Next < offset {
+		return Progress{}, fmt.Errorf("the runner service answered with a build's state its interface doesn't have: %q", out.State)
+	}
+	return out, nil
 }
