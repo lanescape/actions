@@ -88,9 +88,17 @@ func run(ctx context.Context, rt *actions.Runtime, svc *service.Client, machineD
 				if p.State == service.Building || p.Log == "" {
 					break
 				}
-				if p, err = svc.Follow(ctx, b.Build, offsets[b.Build]); err != nil {
+				next, err := svc.Follow(ctx, b.Build, offsets[b.Build])
+				if err != nil {
+					// A build known to have failed fails with its reason,
+					// whatever happens to the rest of its log.
+					if p.State == service.Failed {
+						rt.Logf("The rest of the build's log couldn't be read: %v", explain(image, err))
+						break
+					}
 					return explain(image, err)
 				}
+				p = next
 			}
 			builds[i].State, builds[i].Reason = p.State, p.Reason
 			switch p.State {

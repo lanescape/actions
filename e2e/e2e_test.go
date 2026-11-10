@@ -552,3 +552,20 @@ func TestAFailedBuildsReasonComesFirst(t *testing.T) {
 		t.Fatalf("log:\n%s", r.log)
 	}
 }
+
+func TestAFailedBuildsReasonOutlivesItsLog(t *testing.T) {
+	w := newWorld(t)
+	run := w.gh.PushRun(w.repo, "main")
+	id := w.builds(run, "build")["amd64"]
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/images/builds/" + id, Times: 1, Delay: 300 * time.Millisecond})
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		w.svc.FailBuild(w.srepo, id, "E: broken\n")
+		// The rest of its log can't be read.
+		time.Sleep(300 * time.Millisecond)
+		w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/images/builds/" + id, Respond: service.Unavailable(time.Second)})
+	}()
+	j := w.machine(run)
+	r := w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "build"}}, &j)
+	r.failed(t, "build for amd64 failed: the image's scripts failed")
+}
