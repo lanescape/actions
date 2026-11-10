@@ -491,3 +491,39 @@ func TestCheckoutRefusesAContributionOutsidePullRequestTarget(t *testing.T) {
 		t.Fatalf("err = %v, outputs %v\n%s", r.err, r.outputs, r.log)
 	}
 }
+
+func TestAFinishedBuildsWholeLogIsPrinted(t *testing.T) {
+	w := newWorld(t)
+	run := w.gh.PushRun(w.repo, "main")
+	id := w.builds(run, "build")["amd64"]
+	// More than one answer's worth of log, all written as the build ends,
+	// while the action follows it.
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		w.svc.WriteLog(id, strings.Repeat("a line of output\n", 150_000)+"the last line\n")
+		w.svc.FinishBuild(w.srepo, id, "")
+	}()
+	j := w.machine(run)
+	r := w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "build"}}, &j).ok(t)
+	// A line split between two answers is printed in its two halves.
+	if n := strings.Count(r.log, "a line of output"); n < 149_999 || !strings.Contains(r.log, "the last line") {
+		t.Fatalf("printed %d lines of the log, and its last: %v", n, strings.Contains(r.log, "the last line"))
+	}
+}
+
+func TestAFailedArchitectureFailsBeforeAnotherIsFollowed(t *testing.T) {
+	w := newWorld(t)
+	run := w.gh.PushRun(w.repo, "main")
+	ids := w.builds(run, "multi")
+	w.svc.FailBuild(w.srepo, ids["arm64"], "")
+	followed := 0
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/images/builds/", Respond: func(rw http.ResponseWriter, r *http.Request) {
+		followed++
+		service.Unavailable(time.Second)(rw, r)
+	}})
+	j := w.machine(run)
+	w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "multi"}}, &j).failed(t, "build for arm64 failed")
+	if followed != 0 {
+		t.Fatalf("followed amd64's build %d times before failing on arm64's", followed)
+	}
+}

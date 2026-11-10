@@ -67,7 +67,7 @@ func run(ctx context.Context, rt *actions.Runtime, svc *service.Client, machineD
 		}
 	}
 	for {
-		pending := false
+		pending, more := false, false
 		for i, b := range builds {
 			switch b.State {
 			case service.Failed:
@@ -84,15 +84,23 @@ func run(ctx context.Context, rt *actions.Runtime, svc *service.Client, machineD
 			}
 			offsets[b.Build] = p.Next
 			builds[i].State, builds[i].Reason = p.State, p.Reason
-			if p.State == service.Failed {
+			if p.State == service.Failed && p.Log == "" {
 				return fmt.Errorf("the image %s's build for %s failed: %s", image, b.Architecture, p.Reason)
 			}
-			if p.State == service.Building {
+			// A build is followed until it has ended and its log is
+			// drained: one that ended behind its output has more to give.
+			if p.State == service.Building || p.Log != "" {
 				pending = true
+				builds[i].State = service.Building
 			}
+			more = more || p.Log != ""
 		}
 		if !pending {
 			break
+		}
+		if more {
+			// Its log has more to give now: no wait.
+			continue
 		}
 		select {
 		case <-ctx.Done():

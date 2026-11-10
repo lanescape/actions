@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/lanescape/runners/endpoints"
@@ -49,9 +50,42 @@ type Client struct {
 	url string
 }
 
-// maxAnswer bounds an answer: a megabyte of a build's log, escaped as JSON
-// may escape it, six bytes for every byte at most, with room to spare.
+// maxAnswer bounds an answer: at most a mebibyte of a build's log, as
+// lanescape/runners' spec 0005 has the service give it, escaped as JSON may
+// escape it, six bytes for every byte at most, with room to spare.
 const maxAnswer = 8 << 20
+
+// redact replaces the token wherever it appears in an answer: in its JSON
+// strings once decoded, however escaped, and in its raw bytes otherwise.
+func redact(data []byte, tok string) []byte {
+	var v any
+	if json.Unmarshal(data, &v) != nil {
+		return bytes.ReplaceAll(data, []byte(tok), []byte("***"))
+	}
+	var walk func(any) any
+	walk = func(x any) any {
+		switch t := x.(type) {
+		case string:
+			return strings.ReplaceAll(t, tok, "***")
+		case []any:
+			for i := range t {
+				t[i] = walk(t[i])
+			}
+		case map[string]any:
+			out := make(map[string]any, len(t))
+			for k, e := range t {
+				out[strings.ReplaceAll(k, tok, "***")] = walk(e)
+			}
+			return out
+		}
+		return x
+	}
+	b, err := json.Marshal(walk(v))
+	if err != nil {
+		return bytes.ReplaceAll(data, []byte(tok), []byte("***"))
+	}
+	return b
+}
 
 // DefaultRetry is how long a request waits for the service: eight attempts
 // in all, the waits doubling from 2 seconds to a minute, or what
@@ -159,8 +193,8 @@ func (c *Client) once(ctx context.Context, method, path string, body []byte, out
 		return 0, final{errors.New("the runner service's answer is larger than any its interface gives")}
 	}
 	// Nothing the service sends back reaches the job's log with the
-	// token in it, whatever it says.
-	data = bytes.ReplaceAll(data, []byte(tok), []byte("***"))
+	// token in it, whatever it says, however it's escaped.
+	data = redact(data, tok)
 	var answer struct {
 		Reason    string `json:"reason"`
 		Retryable bool   `json:"retryable"`

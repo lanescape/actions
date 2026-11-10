@@ -8,6 +8,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -223,6 +224,13 @@ func TestTheTokenIsNeverInAnError(t *testing.T) {
 		"a refusal's reason": func(tok string) func(http.ResponseWriter, *http.Request) {
 			return func(w http.ResponseWriter, r *http.Request) {
 				service.Refuse("you sent "+strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))(w, r)
+			}
+		},
+		"a refusal's reason, escaped": func(tok string) func(http.ResponseWriter, *http.Request) {
+			return func(w http.ResponseWriter, r *http.Request) {
+				t := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+				escaped := `\u` + fmt.Sprintf("%04x", t[0]) + t[1:]
+				fault.Status(http.StatusForbidden, nil, `{"error": "Forbidden", "reason": "you sent `+escaped+`"}`)(w, r)
 			}
 		},
 		"a build it doesn't have": func(string) func(http.ResponseWriter, *http.Request) {
