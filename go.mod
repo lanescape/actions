@@ -8,7 +8,7 @@ require (
 	// lanescape/runners pins a commit of its implementation branch until that
 	// merges and is tagged; move the pin then, in a pull request of its own
 	// (specs/0002-releases.md).
-	github.com/lanescape/runners v0.0.0-20261109193736-d9b87c962b45
+	github.com/lanescape/runners v0.0.0-20261110073141-095cf9bcb110
 	go.yaml.in/yaml/v3 v3.0.6
 )
 
@@ -70,5 +70,3 @@ require (
 	google.golang.org/grpc v1.85.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
-
-replace github.com/lanescape/runners => ../runners
