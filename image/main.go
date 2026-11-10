@@ -67,40 +67,41 @@ func run(ctx context.Context, rt *actions.Runtime, svc *service.Client, machineD
 		}
 	}
 	for {
-		pending, more := false, false
+		pending := false
 		for i, b := range builds {
-			switch b.State {
-			case service.Failed:
-				return fmt.Errorf("the image %s's build for %s failed: %s", image, b.Architecture, b.Reason)
-			case service.Ready:
+			if b.State == service.Ready {
 				continue
 			}
 			p, err := svc.Follow(ctx, b.Build, offsets[b.Build])
 			if err != nil {
 				return explain(image, err)
 			}
-			if p.Log != "" {
-				writeLog(rt, fmt.Sprintf("%s %s", b.Architecture, b.Version), p.Log)
+			group := fmt.Sprintf("%s %s", b.Architecture, b.Version)
+			// A build that has ended has its log drained now, all of it,
+			// before anything else: one that ended behind its output has
+			// more to give.
+			for {
+				if p.Log != "" {
+					writeLog(rt, group, p.Log)
+				}
+				offsets[b.Build] = p.Next
+				if p.State == service.Building || p.Log == "" {
+					break
+				}
+				if p, err = svc.Follow(ctx, b.Build, offsets[b.Build]); err != nil {
+					return explain(image, err)
+				}
 			}
-			offsets[b.Build] = p.Next
 			builds[i].State, builds[i].Reason = p.State, p.Reason
-			if p.State == service.Failed && p.Log == "" {
+			switch p.State {
+			case service.Failed:
 				return fmt.Errorf("the image %s's build for %s failed: %s", image, b.Architecture, p.Reason)
-			}
-			// A build is followed until it has ended and its log is
-			// drained: one that ended behind its output has more to give.
-			if p.State == service.Building || p.Log != "" {
+			case service.Building:
 				pending = true
-				builds[i].State = service.Building
 			}
-			more = more || p.Log != ""
 		}
 		if !pending {
 			break
-		}
-		if more {
-			// Its log has more to give now: no wait.
-			continue
 		}
 		select {
 		case <-ctx.Done():

@@ -527,3 +527,28 @@ func TestAFailedArchitectureFailsBeforeAnotherIsFollowed(t *testing.T) {
 		t.Fatalf("followed amd64's build %d times before failing on arm64's", followed)
 	}
 }
+
+func TestAFailedBuildsReasonComesFirst(t *testing.T) {
+	w := newWorld(t)
+	run := w.gh.PushRun(w.repo, "main")
+	ids := w.builds(run, "multi")
+	// amd64 fails with a log while arm64's service answers keep failing.
+	followedArm := 0
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/images/builds/" + ids["arm64"], Respond: func(rw http.ResponseWriter, r *http.Request) {
+		followedArm++
+		service.Unavailable(time.Second)(rw, r)
+	}})
+	// The first look at amd64's build is held while it fails, so the
+	// action sees it failed, with its log, on that look.
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/images/builds/" + ids["amd64"], Times: 1, Delay: 300 * time.Millisecond})
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		w.svc.FailBuild(w.srepo, ids["amd64"], "E: broken\n")
+	}()
+	j := w.machine(run)
+	r := w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "multi"}}, &j)
+	r.failed(t, "build for amd64 failed")
+	if !strings.Contains(r.log, "E: broken") || strings.Contains(r.log, "retries are spent") || followedArm != 0 {
+		t.Fatalf("log:\n%s", r.log)
+	}
+}
