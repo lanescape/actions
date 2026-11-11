@@ -1,0 +1,112 @@
+name: CI
+
+# On pull requests, and from release.yml before a release, the same checks
+# (specs/0002-releases.md). Nothing here needs a credential.
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Test (${{ matrix.platform }})
+    # The organization's own runs are on Blacksmith, never on the runner
+    # service's machines. A fork's pull request runs on GitHub's runners.
+    runs-on: ${{ github.repository_owner_id == '303994381' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && matrix.blacksmith || matrix.github }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            blacksmith: blacksmith-2vcpu-ubuntu-2604
+            github: ubuntu-26.04
+          - platform: linux-arm64
+            blacksmith: blacksmith-4vcpu-ubuntu-2604-arm
+            github: ubuntu-26.04-arm
+          - platform: macos-arm64
+            blacksmith: blacksmith-12vcpu-macos-26
+            github: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: go vet
+        run: |
+          go vet ./...
+          go vet -tags e2e ./...
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files aren't formatted with gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go test
+        run: go test -race ./...
+
+  checkout:
+    name: Check out with checkout (${{ matrix.platform }})
+    # The checkout action itself, as a consumer's job runs it, for the run's
+    # own commit. A contribution's checkout needs a pull_request_target
+    # run, so the tests cover it up to actions/checkout. The runners
+    # action isn't run here, since it would call the runner service, which
+    # CI never relies on.
+    runs-on: ${{ github.repository_owner_id == '303994381' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && matrix.blacksmith || matrix.github }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            blacksmith: blacksmith-2vcpu-ubuntu-2604
+            github: ubuntu-26.04
+          - platform: macos-arm64
+            blacksmith: blacksmith-12vcpu-macos-26
+            github: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./checkout
+      - name: The checkout is the run's commit
+        env:
+          WANT: ${{ github.sha }}
+        run: |
+          have="$(git rev-parse HEAD)"
+          if [ "$have" != "$WANT" ]; then
+            echo "::error::checked out $have, not $WANT"
+            exit 1
+          fi
+
+  build:
+    name: Build every platform
+    runs-on: ${{ github.repository_owner_id == '303994381' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && 'blacksmith-2vcpu-ubuntu-2604' || 'ubuntu-26.04' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: go build
+        # Every program, for every platform runners use, as the actions
+        # build them: pure Go, with CGO off.
+        run: |
+          set -euo pipefail
+          for platform in linux/amd64 linux/arm64 darwin/arm64 windows/amd64; do
+            for dir in */action.yml; do
+              program="${dir%/action.yml}"
+              echo "$program for $platform"
+              CGO_ENABLED=0 GOOS="${platform%/*}" GOARCH="${platform#*/}" \
+                go build -trimpath -o "$RUNNER_TEMP/$platform/$program" "./$program"
+            done
+          done

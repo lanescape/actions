@@ -1,0 +1,83 @@
+name: Release
+
+# On every push to main: CI's checks, then v1 moves forward to the commit
+# (specs/0002-releases.md). Only the Lanescape Actions App may move v*
+# tags, and its key is a secret of the release environment, which only
+# main may deploy to. The job that uses it runs no code from the
+# repository: it checks nothing out, and only calls GitHub's API.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One at a time, never cancelled: a later run waits, and moves v1 past
+# this one's commit.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    # Only the organization's own repository releases; a fork's main
+    # doesn't.
+    if: github.repository_owner_id == '303994381' && github.repository == 'lanescape/actions'
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Move v1
+    needs: checks
+    runs-on: blacksmith-2vcpu-ubuntu-2604
+    environment: release
+    permissions: {}
+    env:
+      TAG: v1
+    steps:
+      - name: Get the App's token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          # GitHub takes an App's ID where it takes its client ID.
+          client-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+      - name: Move the tag forward
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # The commit is still main's: main is it or descends from it.
+          status="$(gh api "repos/$REPO/compare/$SHA...main" --jq .status)"
+          if [ "$status" != identical ] && [ "$status" != ahead ]; then
+            echo "::error::$SHA isn't on main ($status); not releasing it."
+            exit 1
+          fi
+          current="$(gh api "repos/$REPO/git/matching-refs/tags/$TAG" \
+            --jq "map(select(.ref == \"refs/tags/$TAG\")) | .[0].object | select(. != null) | .type + \" \" + .sha")"
+          if [ -z "$current" ]; then
+            gh api --silent -X POST "repos/$REPO/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$SHA"
+            echo "$TAG created at $SHA."
+            exit 0
+          fi
+          type="${current%% *}" old="${current#* }"
+          if [ "$type" != commit ]; then
+            echo "::error::$TAG names a $type, not a commit; a maintainer must look."
+            exit 1
+          fi
+          if [ "$old" = "$SHA" ]; then
+            echo "$TAG is already $SHA."
+            exit 0
+          fi
+          # Only forward: the commit must descend from the one the tag names.
+          status="$(gh api "repos/$REPO/compare/$old...$SHA" --jq .status)"
+          if [ "$status" != ahead ]; then
+            echo "::error::$SHA doesn't descend from $old, which $TAG names ($status); not moving it."
+            exit 1
+          fi
+          # force=false makes GitHub refuse anything but a fast-forward,
+          # whatever happened since the check.
+          gh api --silent -X PATCH "repos/$REPO/git/refs/tags/$TAG" -f "sha=$SHA" -F force=false
+          echo "$TAG moved from $old to $SHA."
