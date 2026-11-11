@@ -1,34 +1,12 @@
-name: Lanescape runners
+name: Lanescape disk
 description: >
-  Makes the labels a workflow's jobs run on: the runner service's selectors
-  inside the lanescape organization, and the fallbacks in
-  .github/runners.json anywhere else. Run it as the run's first job, with
-  contents: read and id-token: write.
+  Asks the runner service for the job's work disk, of a family, and waits
+  until it's mounted at /work. Outside the lanescape organization, or on a
+  runner that isn't the service's, it does nothing.
 inputs:
-  disks:
-    description: >
-      The saved work disks the workflow's jobs use, a JSON object from each
-      family to {"runner", "spot", and "from" or "key"}
-      (specs/0001-actions.md).
-    required: false
-    default: ''
-  fallbacks:
-    description: >
-      The RUNNERS variable, which overrides .github/runners.json's
-      fallbacks outside the organization: pass `${{ vars.RUNNERS }}`, since
-      an action can't read variables itself.
-    required: false
-    default: ''
-  token:
-    description: The token that reads .github/runners.json and the disks' files.
-    required: false
-    default: ${{ github.token }}
-outputs:
-  map:
-    description: >
-      A JSON object from each runner name in .github/runners.json, and each
-      disk's family, to the label its jobs run on.
-    value: ${{ steps.run.outputs.map }}
+  family:
+    description: The family's name, as .github/runners.json declares it at the run's commit.
+    required: true
 runs:
   using: composite
   steps:
@@ -111,12 +89,9 @@ runs:
         fi
         build go build -trimpath -o "$bin" "./$name"
         echo "bin=$bin" >> "$GITHUB_OUTPUT"
-    - name: Make the map
-      id: run
+    - name: Ask for the work disk
       shell: bash
       env:
         PROGRAM: ${{ steps.build.outputs.bin }}
-        INPUT_DISKS: ${{ inputs.disks }}
-        INPUT_FALLBACKS: ${{ inputs.fallbacks }}
-        INPUT_TOKEN: ${{ inputs.token }}
+        INPUT_FAMILY: ${{ inputs.family }}
       run: '"$PROGRAM"'

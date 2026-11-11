@@ -107,7 +107,8 @@ func verify(ctx context.Context, rt *actions.Runtime) error {
 }
 
 func git(ctx context.Context, dir string, args ...string) (string, error) {
-	// The workspace may belong to another user, as in a container job.
+	// The workspace may belong to another user, such as root, if an earlier
+	// step ran as root with sudo.
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-c", "safe.directory=" + dir, "-C", dir}, args...)...)
 	out, err := cmd.Output()
 	if err != nil {

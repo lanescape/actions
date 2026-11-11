@@ -82,6 +82,30 @@ func TestDecide(t *testing.T) {
 
 func ptr[T any](v T) *T { return &v }
 
+// A contribution's checkout is the commit its run was made for, though
+// the pull request has moved on since.
+func TestDecideKeepsTheRunsCommit(t *testing.T) {
+	gh := testgithub.New(t)
+	repo := gh.Repo(gh.Org(endpoints.Organization, "lanescape"), 5001, "app")
+	contributor := gh.User(9001, "contributor")
+	fork := gh.Fork(repo, contributor, 7001)
+	first := fork.Commit("change", map[string]string{"a": "1"})
+	pr := gh.PullRequest(repo, "main", fork, "change", contributor)
+	run := gh.PullRequestTargetRun(pr)
+	later := fork.Commit("change", map[string]string{"a": "2"})
+	gh.Sync(pr)
+	if gh.PullHead(pr) != later || later == first {
+		t.Fatalf("the pull request's head is %s, not %s", gh.PullHead(pr), later)
+	}
+	env := gh.Env(testgithub.Job{Run: run, Pull: pr, Inputs: map[string]string{"contribution": "true"}})
+	if err := decide(runtime(env)); err != nil {
+		t.Fatal(err)
+	}
+	if out := testgithub.Outputs(t, env); out["ref"] != first || out["expect"] != first {
+		t.Fatalf("outputs %v; want the run's commit, %s", out, first)
+	}
+}
+
 func gitIn(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
@@ -119,6 +143,7 @@ func TestVerify(t *testing.T) {
 	for _, kv := range [][2]string{
 		{"http.https://github.com/.extraheader", "AUTHORIZATION: basic x"},
 		{"includeIf.gitdir:/x.path", "/tmp/credentials"},
+		{"credential.helper", "store"},
 	} {
 		gitIn(t, ws, "config", "--local", kv[0], kv[1])
 		if err := verify(ctx, runtime(env)); err == nil || !strings.Contains(err.Error(), "may hold credentials") {

@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -73,7 +74,7 @@ func TestTheBuildIgnoresTheJobsGoSettings(t *testing.T) {
 		t.Skip("builds a program")
 	}
 	sh := bash(t)
-	program, err := filepath.Abs(filepath.Join(root, "runners"))
+	program, err := filepath.Abs(filepath.Join(root, "disk"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +97,7 @@ func TestTheBuildIgnoresTheJobsGoSettings(t *testing.T) {
 		"GOTOOLCHAIN=local", "RUNNER_TEMP=" + dir, "RUNNER_OS=" + map[string]string{"darwin": "macOS", "linux": "Linux"}[runtime.GOOS],
 		"PROGRAM=" + program, "GITHUB_ACTION_PATH=" + program,
 	}
-	path := filepath.Join(root, "runners", "action.yml")
+	path := filepath.Join(root, "disk", "action.yml")
 
 	out := filepath.Join(dir, "find-output")
 	cmd := exec.Command(sh, "-e", "-c", stepScript(t, path, "Find Go"))
@@ -247,6 +248,61 @@ func TestTheReleasesTagQuery(t *testing.T) {
 		out, err := cmd.Output()
 		if err != nil || strings.TrimSpace(string(out)) != want {
 			t.Errorf("%s: %q, %v, want %q", in, out, err, want)
+		}
+	}
+}
+
+// checkout checks for Git 2.18 or newer before it calls actions/checkout,
+// and fails, saying so, without it.
+func TestCheckoutNeedsGit(t *testing.T) {
+	sh := bash(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("stands in for git with a shell script")
+	}
+	steps := actions(t)["checkout"].Runs.Steps
+	git := slices.IndexFunc(steps, func(s step) bool { return s.Name == "Check for Git" })
+	co := slices.IndexFunc(steps, func(s step) bool { return strings.HasPrefix(s.Uses, "actions/checkout@") })
+	if git < 0 || co < 0 || git > co {
+		t.Fatalf("checkout checks for Git at step %d, and calls actions/checkout at %d", git, co)
+	}
+	script := stepScript(t, filepath.Join(root, "checkout", "action.yml"), "Check for Git")
+	sed, err := exec.LookPath("sed")
+	if err != nil {
+		t.Skip("no sed")
+	}
+	for _, tc := range []struct {
+		name, version string
+		says          string
+	}{
+		{name: "no Git", says: "there's no Git here"},
+		{name: "Git 1.9", version: "git version 1.9.5", says: "Git here is 1.9"},
+		{name: "Git 2.17", version: "git version 2.17.1", says: "Git here is 2.17"},
+		{name: "Git 2.18", version: "git version 2.18.0"},
+		{name: "Apple's Git", version: "git version 2.39.5 (Apple Git-154)"},
+		{name: "Git for Windows", version: "git version 2.47.1.windows.2"},
+		{name: "Git 3", version: "git version 3.0.0"},
+	} {
+		dir := t.TempDir()
+		if err := os.Symlink(sed, filepath.Join(dir, "sed")); err != nil {
+			t.Fatal(err)
+		}
+		if tc.version != "" {
+			stub := "#!" + sh + "\n[ \"$1\" = --version ] && echo '" + tc.version + "'\n"
+			if err := os.WriteFile(filepath.Join(dir, "git"), []byte(stub), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		cmd := exec.Command(sh, "-e", "-c", script)
+		cmd.Env = []string{"PATH=" + dir}
+		b, err := cmd.CombinedOutput()
+		if tc.says == "" {
+			if err != nil {
+				t.Errorf("%s: %v\n%s", tc.name, err, b)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(string(b), "::error::checkout needs Git 2.18 or newer") || !strings.Contains(string(b), tc.says) {
+			t.Errorf("%s: err = %v\n%s", tc.name, err, b)
 		}
 	}
 }

@@ -7,7 +7,7 @@ The code is public so that anyone can read it and contribute, but the service th
 - [0001 Actions](specs/0001-actions.md): runner labels, setting up a machine, contributions, `disk`, `checkout` and `save-disk`, and how each degrades outside the organization.
 - [0002 Code, tests and releases](specs/0002-releases.md): Go, tests against `lanescape/runners`' emulator of the runner service and its other emulators, and the `v1` tag only the release App can move.
 
-So far `runners` and `checkout` are built. The specs now replace `runners` with `disk`, and `save` with `save-disk`; those come next.
+`disk`, `checkout` and `save-disk` are built, against lanescape/runners' interface at the commit `go.mod` names.
 
 ## Development
 

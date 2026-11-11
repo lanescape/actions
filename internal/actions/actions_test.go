@@ -12,12 +12,12 @@ func TestRuntime(t *testing.T) {
 	dir := t.TempDir()
 	env := map[string]string{
 		"GITHUB_OUTPUT": filepath.Join(dir, "output"), "GITHUB_STEP_SUMMARY": filepath.Join(dir, "summary"),
-		"INPUT_DISKS": "  {}\n", "INPUT_ALLOW_UNSAFE": "TRUE", "INPUT_BAD": "yes",
+		"INPUT_FAMILY_NAME": "  build\n", "INPUT_ALLOW_UNSAFE": "TRUE", "INPUT_BAD": "yes",
 	}
 	var log bytes.Buffer
 	rt := &Runtime{Getenv: func(k string) string { return env[k] }, Stdout: &log}
-	if rt.Input("disks") != "{}" {
-		t.Errorf("input = %q", rt.Input("disks"))
+	if rt.Input("family-name") != "build" {
+		t.Errorf("input = %q", rt.Input("family-name"))
 	}
 	if v, err := rt.BoolInput("allow-unsafe", false); err != nil || !v {
 		t.Errorf("bool = %v, %v", v, err)
@@ -28,7 +28,7 @@ func TestRuntime(t *testing.T) {
 	if _, err := rt.BoolInput("bad", false); err == nil {
 		t.Error("yes was taken for a boolean")
 	}
-	if err := rt.SetOutput("map", "{\"a\":\n1}"); err != nil {
+	if err := rt.SetOutput("multi", "{\"a\":\n1}"); err != nil {
 		t.Fatal(err)
 	}
 	if err := rt.SetOutput("other", "x"); err != nil {
@@ -36,7 +36,7 @@ func TestRuntime(t *testing.T) {
 	}
 	out, _ := os.ReadFile(env["GITHUB_OUTPUT"])
 	lines := strings.Split(string(out), "\n")
-	if len(lines) != 8 || !strings.HasPrefix(lines[0], "map<<lanescape_") || lines[1] != `{"a":` || lines[2] != "1}" || lines[3] != strings.TrimPrefix(lines[0], "map<<") {
+	if len(lines) != 8 || !strings.HasPrefix(lines[0], "multi<<lanescape_") || lines[1] != `{"a":` || lines[2] != "1}" || lines[3] != strings.TrimPrefix(lines[0], "multi<<") {
 		t.Errorf("output file = %q", out)
 	}
 	if err := rt.Summary("# a\n"); err != nil {

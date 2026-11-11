@@ -1,22 +1,18 @@
 // Package testgithub is what the tests need of lanescape/runners' GitHub
-// emulator beyond the emulator itself: the jobs' tokens, as GitHub gives a
-// job its GITHUB_TOKEN and, with id-token: write, its OIDC tokens, which a
-// test may have another of that repository's emulators mint, such as its
-// service emulator for a job it knows. It's for tests only.
+// emulator beyond the emulator itself: a job's environment, as GitHub gives
+// a step its variables, event, files and GITHUB_TOKEN, and the tokens
+// handed out, which tests check no log shows. It's for tests only.
 package testgithub
 
 import (
-	"bytes"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -32,7 +28,7 @@ import (
 // jobs' GITHUB_TOKENs, as GitHub's own Actions App's do.
 const JobsAppID = 15368
 
-// GitHub is a GitHub emulator and the jobs' token issuers.
+// GitHub is a GitHub emulator and the jobs' token issuer.
 type GitHub struct {
 	*ghemu.Emulator
 	t    *testing.T
@@ -40,21 +36,10 @@ type GitHub struct {
 
 	mu        sync.Mutex
 	installed map[int64]*ghemu.Installation
-	requests  map[string]job
 
-	// TokenURL is ACTIONS_ID_TOKEN_REQUEST_URL for every job.
-	TokenURL string
-	// Audiences are the audiences jobs asked tokens for, in order.
-	Audiences []string
-	// Minted are the OIDC and installation tokens handed to jobs, which
-	// tests check no log shows.
+	// Minted are the installation tokens handed to jobs, which tests check
+	// no log shows.
 	Minted []string
-}
-
-type job struct {
-	run  *ghemu.Run
-	job  ghemu.Job
-	mint func(audience string) string
 }
 
 // New starts an emulator, closed when the test ends.
@@ -62,12 +47,7 @@ func New(t *testing.T) *GitHub {
 	t.Helper()
 	e := ghemu.New()
 	t.Cleanup(e.Close)
-	g := &GitHub{Emulator: e, t: t, jobs: e.NewApp(JobsAppID), installed: map[int64]*ghemu.Installation{}, requests: map[string]job{}}
-	srv := httptest.NewServer(http.HandlerFunc(g.token))
-	t.Cleanup(srv.Close)
-	// GitHub's own URL has a query already; the toolkit adds audience.
-	g.TokenURL = srv.URL + "/token?api-version=2.0"
-	return g
+	return &GitHub{Emulator: e, t: t, jobs: e.NewApp(JobsAppID), installed: map[int64]*ghemu.Installation{}}
 }
 
 // JobToken is a GITHUB_TOKEN for a job of a run in a repository of owner:
@@ -123,95 +103,19 @@ func (g *GitHub) Secrets() []string {
 	return append([]string(nil), g.Minted...)
 }
 
-// RequestToken is ACTIONS_ID_TOKEN_REQUEST_TOKEN for a job of run: the
-// tokens got with it are j's, with the audience asked for.
-func (g *GitHub) RequestToken(run *ghemu.Run, j ghemu.Job) string {
-	return g.requestToken(job{run: run, job: j})
-}
-
-// RequestTokenFrom is ACTIONS_ID_TOKEN_REQUEST_TOKEN for a job whose
-// tokens mint makes, given the audience asked for, or GitHub's default,
-// https://github.com/<owner>, if none was.
-func (g *GitHub) RequestTokenFrom(run *ghemu.Run, mint func(audience string) string) string {
-	return g.requestToken(job{run: run, mint: mint})
-}
-
-func (g *GitHub) requestToken(j job) string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	tok := hex.EncodeToString(b[:])
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.requests[tok] = j
-	g.Minted = append(g.Minted, tok)
-	return tok
-}
-
-// token serves ACTIONS_ID_TOKEN_REQUEST_URL, as GitHub does.
-func (g *GitHub) token(w http.ResponseWriter, r *http.Request) {
-	h := r.Header.Get("Authorization")
-	g.mu.Lock()
-	j, ok := g.requests[stripBearer(h)]
-	aud := r.URL.Query().Get("audience")
-	if ok {
-		g.Audiences = append(g.Audiences, aud)
-	}
-	g.mu.Unlock()
-	if !ok || r.URL.Query().Get("api-version") != "2.0" {
-		http.Error(w, `{"message":"Bad credentials"}`, http.StatusUnauthorized)
-		return
-	}
-	var tok string
-	if j.mint != nil {
-		if aud == "" {
-			aud = "https://github.com/" + j.run.Repo.Owner.Login
-		}
-		tok = j.mint(aud)
-	} else {
-		jj := j.job
-		if aud != "" {
-			jj.Audience = aud
-		}
-		tok = g.ActionsToken(j.run, jj, nil)
-	}
-	g.mu.Lock()
-	g.Minted = append(g.Minted, tok)
-	g.mu.Unlock()
-	var buf bytes.Buffer
-	_ = json.NewEncoder(&buf).Encode(map[string]string{"value": tok})
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(buf.Bytes())
-}
-
-func stripBearer(h string) string {
-	if len(h) > 7 && (h[:7] == "Bearer " || h[:7] == "bearer ") {
-		return h[7:]
-	}
-	return ""
-}
-
 // Job is a job of a run, as a step sees it.
 type Job struct {
 	Run *ghemu.Run
 	// Pull is the event's pull request, for pull_request and
 	// pull_request_target runs.
 	Pull *ghemu.Pull
-	// Claims is what tells the job's OIDC tokens from others in the run,
-	// such as a bootstrap workflow's job_workflow_ref.
-	Claims ghemu.Job
-	// OIDC, if set, mints the job's OIDC tokens in place of the GitHub
-	// emulator, given the audience asked for; Claims is then unused.
-	OIDC func(audience string) string
-	// IDToken is whether the job has id-token: write.
-	IDToken bool
-	// Inputs are the action's inputs, as INPUT_<NAME>. The token input is
-	// the job's GITHUB_TOKEN unless set.
+	// Inputs are the action's inputs, as INPUT_<NAME>.
 	Inputs map[string]string
 }
 
 // Env is the job's environment, as GitHub gives a step: its GITHUB_
-// variables, its event's payload, output and summary files, and its token
-// endpoint if it may get OIDC tokens.
+// variables, its event's payload, output and summary files, and its
+// GITHUB_TOKEN.
 func (g *GitHub) Env(j Job) map[string]string {
 	g.t.Helper()
 	dir := g.t.TempDir()
@@ -258,15 +162,9 @@ func (g *GitHub) Env(j Job) map[string]string {
 		"GITHUB_STEP_SUMMARY":        filepath.Join(dir, "summary"),
 		"GITHUB_WORKSPACE":           ws,
 		"RUNNER_TEMP":                dir,
-		"INPUT_TOKEN":                g.JobToken(run.Repo.Owner),
-	}
-	if j.IDToken {
-		env["ACTIONS_ID_TOKEN_REQUEST_URL"] = g.TokenURL
-		if j.OIDC != nil {
-			env["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = g.RequestTokenFrom(run, j.OIDC)
-		} else {
-			env["ACTIONS_ID_TOKEN_REQUEST_TOKEN"] = g.RequestToken(run, j.Claims)
-		}
+		// A job may give its steps its token, as many do; no action
+		// reads it, and no log may show it.
+		"GITHUB_TOKEN": g.JobToken(run.Repo.Owner),
 	}
 	for k, v := range j.Inputs {
 		env["INPUT_"+strings.ToUpper(strings.ReplaceAll(k, "-", "_"))] = v

@@ -1,31 +1,35 @@
 // Package e2e runs the actions' programs as GitHub would run them, with a
-// job's environment and event, against lanescape/runners' emulator of the
-// service, emulators/service, at the version go.mod names, and that
-// repository's own GitHub emulator and its OIDC issuer
-// (specs/0002-releases.md, Tests). That repository's conformance suite
-// holds the emulator to the real service's answers.
+// job's environment and event, on one of the runner service's machines as
+// Compute Engine gives it a metadata server, against lanescape/runners'
+// emulator of the service, emulators/service, at the version go.mod
+// names, and that repository's own GitHub emulator (specs/0002-releases.md,
+// Tests). That repository's conformance suite holds the emulator to the
+// real service's answers.
 //
 // There is one GitHub: each test makes its repository, branches, pull
-// requests, runs and jobs in the GitHub emulator, which serves the API,
-// event and tokens a job sees, and the service emulator reads the same
-// state through service.WithGitHub. Its RepositoryOf, PullRequestOf and
-// RunOf give the service's handles for what a test made there.
+// requests, runs, jobs and approvals in the GitHub emulator, which serves
+// the API and event a job sees, and the service emulator reads the same
+// state through service.WithGitHub. Its RepositoryOf, RunOf and JobOf give
+// the service's handles for what a test made there.
 //
 // The programs are built with the e2e tag, which lets them call the
-// emulator in place of endpoints.Service and wait milliseconds between
-// retries; nothing else differs from what the actions build.
+// emulator in place of endpoints.Service, use a test's metadata server and
+// stand-in for /proc/self/mountinfo, and wait milliseconds; nothing else
+// differs from what the actions build.
 package e2e
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,26 +38,33 @@ import (
 	"github.com/lanescape/runners/emulators/service"
 	"github.com/lanescape/runners/endpoints"
 
-	"github.com/lanescape/actions/internal/selector"
 	"github.com/lanescape/actions/internal/testgithub"
 )
 
 const (
-	bootstrap   = "lanescape/app/.github/workflows/bootstrap.yml@refs/heads/main"
-	runnersJSON = `{
-  "lanescape-80vcpu-linux-amd64": "ubuntu-24.04",
-  "lanescape-2vcpu-linux-arm64": ["ubuntu-24.04-arm"],
-  "bootstrap": "` + bootstrap + `",
-  "branches": {"support/v1": "v1"}
-}`
-	disksInput = `{"build": {"runner": "lanescape-80vcpu-linux-amd64", "spot": true, "from": ["deps/versions.json", "rust-toolchain.toml"]},
-  "cache": {"runner": "lanescape-2vcpu-linux-arm64"}}`
+	small = "lanescape-2vcpu-linux-amd64"
+	large = "lanescape-80vcpu-linux-amd64-spot"
+)
+
+// files are the repository's: two families of work disks, build, keyed by
+// go.sum, and cache, with one key.
+var files = map[string]string{
+	".github/runners.json": `{"disks": {"build": {"from": ["go.sum"]}, "cache": {}}}`,
+	"go.sum":               "example.com/a v1.0.0 h1:x\n",
+}
+
+// mounts are a machine's mounts, as /proc/self/mountinfo shows them, before
+// its work disk is mounted, and the line its mount adds.
+const (
+	mounts = "22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n" +
+		"25 22 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw\n"
+	workMount = "40 22 8:16 / /work rw,relatime shared:20 - ext4 /dev/sdb rw\n"
 )
 
 // bins are the programs, built once.
 var bins struct {
-	dir               string
-	runners, checkout string
+	dir                      string
+	disk, saveDisk, checkout string
 }
 
 func TestMain(m *testing.M) {
@@ -72,22 +83,20 @@ func buildAndRun(m *testing.M) (int, error) {
 	}
 	defer os.RemoveAll(dir)
 	bins.dir = dir
-	bins.runners = filepath.Join(dir, "runners")
-	bins.checkout = filepath.Join(dir, "checkout")
-	build := func(args ...string) error {
-		cmd := exec.Command("go", append([]string{"build", "-trimpath", "-tags", "e2e"}, args...)...)
+	build := func(name string) (string, error) {
+		out := filepath.Join(dir, name)
+		cmd := exec.Command("go", "build", "-trimpath", "-tags", "e2e", "-o", out, "./"+name)
 		cmd.Dir = ".."
 		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOWORK=off", "GOFLAGS=")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("go build %v: %v\n%s", args, err, out)
+		if b, err := cmd.CombinedOutput(); err != nil {
+			return "", fmt.Errorf("go build %s: %v\n%s", name, err, b)
 		}
-		return nil
+		return out, nil
 	}
-	if err := build("-o", bins.runners, "./runners"); err != nil {
-		return 0, err
-	}
-	if err := build("-o", bins.checkout, "./checkout"); err != nil {
-		return 0, err
+	for name, into := range map[string]*string{"disk": &bins.disk, "save-disk": &bins.saveDisk, "checkout": &bins.checkout} {
+		if *into, err = build(name); err != nil {
+			return 0, err
+		}
 	}
 	return m.Run(), nil
 }
@@ -98,14 +107,19 @@ type world struct {
 	svc         *service.Emulator
 	org         *ghemu.Account
 	repo        *ghemu.Repo
-	srepo       service.Repository
-	member      *ghemu.Account
 	contributor *ghemu.Account
+	// elsewhere is the metadata server of a machine that isn't the
+	// service's: it has no attribute lsr-service, and gives no tokens.
+	elsewhere string
+
+	mu sync.Mutex
+	// requests are the requests that reached the service, by path.
+	requests []string
 }
 
 // newWorld starts the GitHub emulator, with the organization by its real
-// ID and a repository, and the service emulator, which checks jobs' tokens
-// against the GitHub emulator's OIDC issuer and knows the same repository.
+// ID and a repository whose commit declares families of work disks, and
+// the service emulator, which reads the same GitHub.
 func newWorld(t *testing.T) *world {
 	t.Helper()
 	if testing.Short() {
@@ -117,59 +131,74 @@ func newWorld(t *testing.T) *world {
 	if svc.Organization() != endpoints.Organization {
 		t.Fatalf("the service emulator serves %d, not the organization", svc.Organization())
 	}
-	org := gh.Org(endpoints.Organization, "lanescape")
-	gh.SetForkApproval(org, ghemu.ApproveAllExternalContributors)
+	org := gh.Account(endpoints.Organization)
 	repo := gh.Repo(org, gh.NewID(), "app")
-	srepo := svc.RepositoryOf(repo)
-	repo.Commit("main", map[string]string{
-		".github/runners.json": runnersJSON,
-		"deps/versions.json":   "café 1.0\n",
-		"rust-toolchain.toml":  "\n",
-	})
-	member := gh.User(8001, "member")
-	contributor := gh.User(9001, "contributor")
-	return &world{t: t, gh: gh, svc: svc, org: org, repo: repo, srepo: srepo, member: member, contributor: contributor}
+	repo.Commit("main", files)
+	gh.ProtectEnvironment(repo, "contribution")
+	elsewhere := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(elsewhere.Close)
+	w := &world{t: t, gh: gh, svc: svc, org: org, repo: repo, contributor: gh.User(9001, "contributor"), elsewhere: elsewhere.URL}
+	svc.Faults().Add(fault.Rule{PathPrefix: "/v1/", Match: func(r *http.Request) bool {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.requests = append(w.requests, r.URL.Path)
+		return false
+	}})
+	return w
 }
 
-// push is a push to a branch, as GitHub and the service see it.
-func (w *world) push(branch string) (*ghemu.Run, service.Run) {
-	run := w.gh.PushRun(w.repo, branch)
-	return run, w.svc.RunOf(run)
+// asked is how many requests reached the service at path.
+func (w *world) asked(path string) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n := 0
+	for _, p := range w.requests {
+		if p == path {
+			n++
+		}
+	}
+	return n
 }
 
-// job starts a job of a run on one of GitHub's own runners, as the service
-// sees it; workflowRef is its job_workflow_ref, or empty for the run's own
-// workflow's.
-func (w *world) job(run service.Run, workflowRef string) *service.Job {
-	j := w.svc.StartJob(run, workflowRef)
-	return &j
-}
-
-// pullRequest opens a pull request into main from a new branch, head, of
-// the repository, with files changed.
-func (w *world) pullRequest(head string, files map[string]string) (*ghemu.Pull, service.PullRequest) {
+// start starts a job of a run, naming a selector, on one of the service's
+// machines, which binds the run as the service's check would.
+func (w *world) start(run *ghemu.Run, selector string) *machine {
 	w.t.Helper()
-	w.repo.Commit(head, files)
-	pr := w.gh.PullRequest(w.repo, "main", w.repo, head, w.member)
-	return pr, w.svc.PullRequestOf(pr)
+	j, err := w.svc.StartJob(w.svc.RunOf(run), selector)
+	if err != nil {
+		w.t.Fatalf("the job's check: %v", err)
+	}
+	return w.on(j)
 }
 
-// forkPullRequest opens a pull request into main from the contributor's
-// fork, from its branch head with files changed. The fork is made in the
-// GitHub emulator, which the service emulator reads.
-func (w *world) forkPullRequest(head string, files map[string]string) (*ghemu.Repo, *ghemu.Pull, service.PullRequest) {
-	w.t.Helper()
-	fork := w.gh.Fork(w.repo, w.contributor, w.gh.NewID())
-	fork.Commit(head, files)
-	pr := w.gh.PullRequest(w.repo, "main", fork, head, w.contributor)
-	return fork, pr, w.svc.PullRequestOf(pr)
+// machine is one of the service's machines, running a job, with the
+// mounts its job's steps see.
+type machine struct {
+	job       service.Job
+	mountinfo string
 }
 
-// bound checks the run's binding as the service emulator holds it.
-func (w *world) bound(run service.Run, want string) {
+func (w *world) on(j service.Job) *machine {
 	w.t.Helper()
-	if got, ok := w.svc.Binding(run); !ok || got != want {
-		w.t.Fatalf("the service bound %q (%v), not %q", got, ok, want)
+	m := &machine{job: j, mountinfo: filepath.Join(w.t.TempDir(), "mountinfo")}
+	m.mount(w.t, false)
+	return m
+}
+
+// mount shows the work disk mounted at /work, or not, as the machine
+// mounts it on the host.
+func (m *machine) mount(t *testing.T, mounted bool) {
+	info := mounts
+	if mounted {
+		info += workMount
+	}
+	tmp := m.mountinfo + ".new"
+	if err := os.WriteFile(tmp, []byte(info), 0o644); err != nil {
+		t.Error(err)
+		return
+	}
+	if err := os.Rename(tmp, m.mountinfo); err != nil {
+		t.Error(err)
 	}
 }
 
@@ -181,18 +210,24 @@ type result struct {
 	summary string
 }
 
-// step runs a program as a step of job, as GitHub would. sj, if not nil,
-// is the same job as the service emulator knows it, which then mints the
-// job's OIDC tokens, with the audience the program asks for.
-func (w *world) step(bin string, j testgithub.Job, sj *service.Job, args ...string) result {
+// step runs a program as a step of a job, as GitHub would. On one of the
+// service's machines, m, its metadata server answers the attribute
+// lsr-service and mints the machine's identity token; without one, it's
+// some other runner, whose metadata server has no such attribute.
+func (w *world) step(bin string, j testgithub.Job, m *machine, args ...string) result {
 	w.t.Helper()
-	if sj != nil {
-		job := *sj
-		j.OIDC = func(audience string) string { return w.svc.Token(job, map[string]any{"aud": audience}) }
-	}
 	env := w.gh.Env(j)
 	cmd := exec.Command(bin, args...)
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "LANESCAPE_TEST_SERVICE=" + w.svc.URL()}
+	if m != nil {
+		cmd.Env = append(cmd.Env, "LANESCAPE_TEST_METADATA="+w.svc.Metadata(m.job), "LANESCAPE_TEST_MOUNTINFO="+m.mountinfo)
+	} else {
+		info := filepath.Join(w.t.TempDir(), "mountinfo")
+		if err := os.WriteFile(info, []byte(mounts), 0o644); err != nil {
+			w.t.Fatal(err)
+		}
+		cmd.Env = append(cmd.Env, "LANESCAPE_TEST_METADATA="+w.elsewhere, "LANESCAPE_TEST_MOUNTINFO="+info)
+	}
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
@@ -204,277 +239,350 @@ func (w *world) step(bin string, j testgithub.Job, sj *service.Job, args ...stri
 		w.t.Fatal(err)
 	}
 	r := result{err: err, log: log.String(), outputs: testgithub.Outputs(w.t, env), summary: testgithub.Summary(w.t, env)}
-	// No token handed to the job appears in its log, but to be masked.
-	for _, s := range w.gh.Secrets() {
-		if strings.Contains(strings.ReplaceAll(r.log, "::add-mask::"+s, ""), s) {
-			w.t.Fatalf("a token is in the step's log:\n%s", r.log)
+	// No token handed to the job appears in its log or summary, nor the
+	// machine's identity token.
+	secrets := w.gh.Secrets()
+	if m != nil {
+		secrets = append(secrets, w.svc.Token(m.job))
+	}
+	for _, s := range secrets {
+		if strings.Contains(strings.ReplaceAll(r.log, "::add-mask::"+s, ""), s) || strings.Contains(r.summary, s) {
+			w.t.Fatalf("a token is in the step's log or summary:\n%s\n%s", r.log, r.summary)
+		}
+	}
+	if strings.Contains(r.log, "eyJ") || strings.Contains(r.summary, "eyJ") {
+		w.t.Fatalf("something like a token is in the step's log or summary:\n%s\n%s", r.log, r.summary)
+	}
+	return r
+}
+
+func (r result) ok(t *testing.T) result {
+	t.Helper()
+	if r.err != nil {
+		t.Fatalf("the step failed: %v\n%s", r.err, r.log)
+	}
+	return r
+}
+
+func (r result) failed(t *testing.T, says string) result {
+	t.Helper()
+	if r.err == nil || !strings.Contains(r.log, "::error::") || !strings.Contains(r.log, says) {
+		t.Fatalf("err = %v; want a failure saying %q:\n%s", r.err, says, r.log)
+	}
+	return r
+}
+
+func (r result) says(t *testing.T, texts ...string) result {
+	t.Helper()
+	for _, s := range texts {
+		if !strings.Contains(r.summary, s) {
+			t.Fatalf("the summary doesn't say %q:\n%s\nlog:\n%s", s, r.summary, r.log)
 		}
 	}
 	return r
 }
 
-func (r result) runnersMap(t *testing.T) map[string]any {
-	t.Helper()
-	if r.err != nil {
-		t.Fatalf("the step failed: %v\n%s", r.err, r.log)
-	}
-	m := map[string]any{}
-	if err := json.Unmarshal([]byte(r.outputs["map"]), &m); err != nil {
-		t.Fatalf("map %q: %v", r.outputs["map"], err)
-	}
-	return m
+func disk(run *ghemu.Run, family string) testgithub.Job {
+	return testgithub.Job{Run: run, Inputs: map[string]string{"family": family}}
 }
 
-func key(family, runner string, files ...string) string {
-	var fs []selector.File
-	for i := 0; i < len(files); i += 2 {
-		fs = append(fs, selector.File{Path: files[i], Contents: []byte(files[i+1])})
-	}
-	return selector.DiskKey(family, runner, fs)
-}
-
-func expectMap(t *testing.T, got map[string]any, want map[string]any) {
-	t.Helper()
-	g, _ := json.Marshal(got)
-	wnt, _ := json.Marshal(want)
-	if string(g) != string(wnt) {
-		t.Fatalf("map = %s\nwant  %s", g, wnt)
-	}
-}
-
-func TestAPushToMainBindsMain(t *testing.T) {
+func TestAWorkDiskReadyAtOnce(t *testing.T) {
 	w := newWorld(t)
-	run, srun := w.push("main")
-	r := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true, Inputs: map[string]string{"disks": disksInput}}, w.job(srun, ""))
-	k := key("build", "lanescape-80vcpu-linux-amd64", "deps/versions.json", "café 1.0\n", "rust-toolchain.toml", "\n")
-	expectMap(t, r.runnersMap(t), map[string]any{
-		"build":                        "lanescape-80vcpu-linux-amd64-spot-disk-build-" + k + "-main",
-		"cache":                        "lanescape-2vcpu-linux-arm64-disk-cache-00000000000000000000-main",
-		"lanescape-2vcpu-linux-arm64":  "lanescape-2vcpu-linux-arm64-main",
-		"lanescape-80vcpu-linux-amd64": "lanescape-80vcpu-linux-amd64-main",
-	})
-	if !strings.Contains(r.summary, "Inside the lanescape organization") || !strings.Contains(r.summary, "scope is `main`") {
-		t.Fatalf("summary = %s", r.summary)
+	run := w.gh.PushRun(w.repo, "main")
+	m := w.start(run, large)
+	m.mount(t, true)
+	w.step(bins.disk, disk(run, "build"), m).ok(t).
+		says(t, "Inside the lanescape organization", "family `build`, is mounted at `/work`", "(`none`)")
+	if d, ok := w.svc.WorkDisk(m.job); !ok || d.Family != "build" || !d.Ready || d.Scope != "main" {
+		t.Fatalf("the service's work disk = %+v, %v", d, ok)
 	}
-	w.bound(srun, "main")
-	// The token's audience is the service.
-	if a := w.gh.Audiences; len(a) != 1 || a[0] != w.svc.URL() {
-		t.Fatalf("audiences = %v", a)
-	}
-	// Binding again, as a rerun's first job does, gives the same binding.
-	w.gh.Rerun(run)
-	srun = w.svc.RunOf(run)
-	again := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true, Inputs: map[string]string{"disks": disksInput}}, w.job(srun, ""))
-	if again.outputs["map"] != r.outputs["map"] {
-		t.Fatalf("rebinding gave %s", again.outputs["map"])
+	if n := w.asked("/v1/disks"); n != 1 {
+		t.Fatalf("asked %d times for a disk ready at once", n)
 	}
 }
 
-func TestAPushToAListedBranchBindsItsScope(t *testing.T) {
+func TestAWorkDiskMadeWhileTheActionAsks(t *testing.T) {
 	w := newWorld(t)
-	w.repo.Commit("support/v1", map[string]string{"deps/versions.json": "café 0.9\n"})
-	run, srun := w.push("support/v1")
-	r := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true, Inputs: map[string]string{"disks": disksInput}}, w.job(srun, ""))
-	// The files are read at the branch's commit.
-	k := key("build", "lanescape-80vcpu-linux-amd64", "deps/versions.json", "café 0.9\n", "rust-toolchain.toml", "\n")
-	expectMap(t, r.runnersMap(t), map[string]any{
-		"build":                        "lanescape-80vcpu-linux-amd64-spot-disk-build-" + k + "-branch-v1",
-		"cache":                        "lanescape-2vcpu-linux-arm64-disk-cache-00000000000000000000-branch-v1",
-		"lanescape-2vcpu-linux-arm64":  "lanescape-2vcpu-linux-arm64-branch-v1",
-		"lanescape-80vcpu-linux-amd64": "lanescape-80vcpu-linux-amd64-branch-v1",
-	})
-	if !strings.Contains(r.summary, "scope is `branch-v1`") {
-		t.Fatalf("summary = %s", r.summary)
-	}
-	w.bound(srun, "branch-v1")
-}
-
-func TestAPullRequestsRunBindsItsScopeAndKeys(t *testing.T) {
-	w := newWorld(t)
-	pr, _ := w.pullRequest("deps", map[string]string{"deps/versions.json": "café 2.0\n"})
-	run := w.gh.PullRequestRun(pr)
-	srun := w.svc.RunOf(run)
-	r := w.step(bins.runners, testgithub.Job{Run: run, Pull: pr, IDToken: true, Inputs: map[string]string{"disks": disksInput}}, w.job(srun, ""))
-	scope := fmt.Sprintf("pr%d", pr.Number)
-	// The files are read at the run's commit, so the key is the pull
-	// request's, beside main's rather than over it.
-	k := key("build", "lanescape-80vcpu-linux-amd64", "deps/versions.json", "café 2.0\n", "rust-toolchain.toml", "\n")
-	mainKey := key("build", "lanescape-80vcpu-linux-amd64", "deps/versions.json", "café 1.0\n", "rust-toolchain.toml", "\n")
-	if k == mainKey {
-		t.Fatal("the keys are the same")
-	}
-	expectMap(t, r.runnersMap(t), map[string]any{
-		"build":                        "lanescape-80vcpu-linux-amd64-spot-disk-build-" + k + "-" + scope,
-		"cache":                        "lanescape-2vcpu-linux-arm64-disk-cache-00000000000000000000-" + scope,
-		"lanescape-2vcpu-linux-arm64":  "lanescape-2vcpu-linux-arm64-" + scope,
-		"lanescape-80vcpu-linux-amd64": "lanescape-80vcpu-linux-amd64-" + scope,
-	})
-	w.bound(srun, scope)
-}
-
-func TestAForksRunFallsBack(t *testing.T) {
-	w := newWorld(t)
-	fork := w.gh.Fork(w.repo, w.contributor, 7001)
-	run := w.gh.PushRun(fork, "main")
-	r := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true, Inputs: map[string]string{
-		"disks":     disksInput,
-		"fallbacks": `{"lanescape-2vcpu-linux-arm64": ["self-hosted", "arm64"]}`,
-	}}, nil)
-	expectMap(t, r.runnersMap(t), map[string]any{
-		"build":                        "ubuntu-24.04",
-		"cache":                        []any{"self-hosted", "arm64"},
-		"lanescape-2vcpu-linux-arm64":  []any{"self-hosted", "arm64"},
-		"lanescape-80vcpu-linux-amd64": "ubuntu-24.04",
-	})
-	if len(w.gh.Audiences) != 0 {
-		t.Fatal("a fork's run asked for a token for the service")
-	}
-	if !strings.Contains(r.summary, "Outside the lanescape organization") {
-		t.Fatalf("summary = %s", r.summary)
-	}
-}
-
-func TestAForksPullRequestIntoTheOrganizationFallsBack(t *testing.T) {
-	w := newWorld(t)
-	_, pr, _ := w.forkPullRequest("change", map[string]string{".github/runners.json": `{"lanescape-80vcpu-linux-amd64": "ubuntu-26.04"}`})
-	run := w.gh.PullRequestRun(pr)
-	srun := w.svc.RunOf(run)
-	r := w.step(bins.runners, testgithub.Job{Run: run, Pull: pr, IDToken: true, Inputs: map[string]string{
-		"fallbacks": `{"lanescape-80vcpu-linux-amd64": "organization-runner"}`,
-	}}, w.job(srun, ""))
-	// The run's commit is the merge of the fork's change, whose file it
-	// reads; the organization's RUNNERS is ignored.
-	expectMap(t, r.runnersMap(t), map[string]any{"lanescape-80vcpu-linux-amd64": "ubuntu-26.04"})
-	if len(w.gh.Audiences) != 0 {
-		t.Fatal("a fork's pull request asked for a token for the service")
-	}
-	if _, ok := w.svc.Binding(srun); ok {
-		t.Fatal("a fork's pull request bound its run")
-	}
-	if !strings.Contains(r.summary, "a fork's pull request") {
-		t.Fatalf("summary = %s", r.summary)
-	}
-	// Its checkout is the run's own commit, as actions/checkout's.
-	c := w.step(bins.checkout, testgithub.Job{Run: run, Pull: pr}, nil, "decide")
-	if c.err != nil || c.outputs["repository"] != "" || c.outputs["ref"] != "" || c.outputs["persist-credentials"] != "true" {
-		t.Fatalf("checkout = %v %v\n%s", c.err, c.outputs, c.log)
-	}
-}
-
-func TestAnApprovedContribution(t *testing.T) {
-	w := newWorld(t)
-	fork, pr, _ := w.forkPullRequest("change", map[string]string{"deps/versions.json": "café 3.0\n", ".github/runners.json": `{"lanescape-2vcpu-linux-amd64": "x"}`})
-	head := pr.HeadSHA
-	run := w.gh.PullRequestTargetRun(pr)
-	srun := w.svc.RunOf(run)
-	// The contributor pushes again once the run was approved: its jobs
-	// still build the commit it was approved for, from the run's own event,
-	// and the service binds that commit as one of the pull request's.
-	fork.Commit("change", map[string]string{"deps/versions.json": "café 4.0\n"})
-	w.gh.Sync(pr)
-	if pr.HeadSHA == head {
-		t.Fatal("the pull request didn't move")
-	}
-	// The bootstrap workflow's job binds the contribution's scope.
-	r := w.step(bins.runners, testgithub.Job{Run: run, Pull: pr, IDToken: true, Inputs: map[string]string{"disks": disksInput}},
-		w.job(srun, w.svc.Bootstrap(w.srepo)))
-	scope := fmt.Sprintf("pr%d", pr.Number)
-	// runners.json is the default branch's; the disks' files are the
-	// contribution's.
-	k := key("build", "lanescape-80vcpu-linux-amd64", "deps/versions.json", "café 3.0\n", "rust-toolchain.toml", "\n")
-	expectMap(t, r.runnersMap(t), map[string]any{
-		"build":                        "lanescape-80vcpu-linux-amd64-spot-disk-build-" + k + "-" + scope,
-		"cache":                        "lanescape-2vcpu-linux-arm64-disk-cache-00000000000000000000-" + scope,
-		"lanescape-2vcpu-linux-arm64":  "lanescape-2vcpu-linux-arm64-" + scope,
-		"lanescape-80vcpu-linux-amd64": "lanescape-80vcpu-linux-amd64-" + scope,
-	})
-	w.bound(srun, scope)
-	// The contribution's jobs check out exactly its head.
-	c := w.step(bins.checkout, testgithub.Job{Run: run, Pull: pr, Inputs: map[string]string{"contribution": "true"}}, nil, "decide")
-	if c.err != nil {
-		t.Fatalf("checkout: %v\n%s", c.err, c.log)
-	}
-	want := map[string]string{"repository": "contributor/app", "ref": head, "persist-credentials": "false", "allow-unsafe-pr-checkout": "true", "expect": head}
-	for k, v := range want {
-		if c.outputs[k] != v {
-			t.Fatalf("checkout outputs = %v, want %v", c.outputs, want)
+	run := w.gh.PushRun(w.repo, "main")
+	m := w.start(run, large)
+	// The disk is made once the program has asked three times, and the
+	// machine mounts it a moment after.
+	w.svc.HoldDisks(true)
+	var asked atomic.Int32
+	done := make(chan struct{})
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks", Match: func(*http.Request) bool {
+		if asked.Add(1) == 3 {
+			w.svc.HoldDisks(false)
+			go func() {
+				defer close(done)
+				time.Sleep(50 * time.Millisecond)
+				m.mount(t, true)
+			}()
 		}
+		return false
+	}})
+	r := w.step(bins.disk, disk(run, "build"), m).ok(t).says(t, "is mounted at `/work`")
+	<-done
+	if !strings.Contains(r.log, "is making the work disk") || w.asked("/v1/disks") != 3 {
+		t.Fatalf("asked %d times while the disk was made:\n%s", w.asked("/v1/disks"), r.log)
 	}
 }
 
-// Run directly in a pull_request_target workflow, not from the bootstrap,
-// the action gets the read scope.
-func TestAPullRequestTargetRunOutsideTheBootstrapReads(t *testing.T) {
+func TestAWorkDiskNeverMounted(t *testing.T) {
 	w := newWorld(t)
-	_, pr, _ := w.forkPullRequest("change", map[string]string{"a": "1"})
+	run := w.gh.PushRun(w.repo, "main")
+	m := w.start(run, large)
+	w.step(bins.disk, disk(run, "build"), m).failed(t, "isn't mounted at /work after")
+}
+
+// Where the disk came from, the answer's restored, is in the summary: here
+// main's disk for the key, saved by an earlier run's job.
+func TestWhereAWorkDiskCameFrom(t *testing.T) {
+	w := newWorld(t)
+	first := w.gh.PushRun(w.repo, "main")
+	m := w.start(first, large)
+	m.mount(t, true)
+	w.step(bins.disk, disk(first, "build"), m).ok(t)
+	w.step(bins.saveDisk, testgithub.Job{Run: first}, m).ok(t)
+	w.svc.FinishJob(m.job, "success")
+	if saved := w.svc.SavedDisks(w.svc.RepositoryOf(w.repo)); len(saved) != 1 || saved[0].Family != "build" {
+		t.Fatalf("saved %+v", saved)
+	}
+	next := w.gh.PushRun(w.repo, "main")
+	m = w.start(next, large)
+	m.mount(t, true)
+	w.step(bins.disk, disk(next, "build"), m).ok(t).says(t, "main's disk for this key (`main_exact`)")
+}
+
+func TestAFamilyTheCommitDoesntDeclare(t *testing.T) {
+	w := newWorld(t)
+	run := w.gh.PushRun(w.repo, "main")
+	m := w.start(run, large)
+	m.mount(t, true)
+	w.step(bins.disk, disk(run, "tests"), m).failed(t, "doesn't declare the family tests")
+}
+
+// A job has one work disk: a second family is refused, and the same one
+// again succeeds at once.
+func TestOneWorkDiskForAJob(t *testing.T) {
+	w := newWorld(t)
+	run := w.gh.PushRun(w.repo, "main")
+	m := w.start(run, large)
+	m.mount(t, true)
+	w.step(bins.disk, disk(run, "build"), m).ok(t)
+	w.step(bins.disk, disk(run, "cache"), m).failed(t, "a job has one work disk")
+	w.step(bins.disk, disk(run, "build"), m).ok(t).says(t, "family `build`, is mounted")
+}
+
+func TestAFamilyThatIsntAName(t *testing.T) {
+	w := newWorld(t)
+	run := w.gh.PushRun(w.repo, "main")
+	m := w.start(run, large)
+	for _, f := range []string{"", "Build", "build-", "1build", strings.Repeat("a", 33), "a b"} {
+		w.step(bins.disk, disk(run, f), m).failed(t, "isn't a family's name")
+	}
+	if n := w.asked("/v1/disks"); n != 0 {
+		t.Fatalf("asked the service %d times", n)
+	}
+}
+
+func TestSaveDiskInAScopeThatSaves(t *testing.T) {
+	w := newWorld(t)
+	run := w.gh.PushRun(w.repo, "main")
+	m := w.start(run, large)
+	m.mount(t, true)
+	w.step(bins.disk, disk(run, "build"), m).ok(t)
+	w.step(bins.saveDisk, testgithub.Job{Run: run}, m).ok(t).says(t, "the run's scope saves, so the runner service saves it")
+	if d, _ := w.svc.WorkDisk(m.job); !d.Save {
+		t.Fatal("the service wasn't asked to save the disk")
+	}
+}
+
+// A push to a branch the consumer doesn't list is in the read scope, which
+// saves nothing; save-disk still succeeds, saying why.
+func TestSaveDiskInAScopeThatSavesNothing(t *testing.T) {
+	w := newWorld(t)
+	w.repo.Commit("feature", map[string]string{"x": "1"})
+	run := w.gh.PushRun(w.repo, "feature")
+	m := w.start(run, large)
+	m.mount(t, true)
+	w.step(bins.disk, disk(run, "build"), m).ok(t)
+	w.step(bins.saveDisk, testgithub.Job{Run: run}, m).ok(t).says(t, "saves nothing, so it won't be", "read")
+	w.svc.FinishJob(m.job, "success")
+	if saved := w.svc.SavedDisks(w.svc.RepositoryOf(w.repo)); len(saved) != 0 {
+		t.Fatalf("saved %+v", saved)
+	}
+}
+
+func TestSaveDiskWithNoWorkDisk(t *testing.T) {
+	w := newWorld(t)
+	run := w.gh.PushRun(w.repo, "main")
+	m := w.start(run, large)
+	w.step(bins.saveDisk, testgithub.Job{Run: run}, m).failed(t, "no work disk")
+}
+
+func TestOnAMachineThatIsntTheServices(t *testing.T) {
+	w := newWorld(t)
+	run := w.gh.PushRun(w.repo, "main")
+	r := w.step(bins.disk, disk(run, "build"), nil).ok(t).says(t, "Inside the lanescape organization", "isn't one of the runner service's machines")
+	if !strings.Contains(r.log, "does nothing here") {
+		t.Fatalf("log:\n%s", r.log)
+	}
+	w.step(bins.saveDisk, testgithub.Job{Run: run}, nil).ok(t).says(t, "isn't one of the runner service's machines")
+	if len(w.requests) != 0 {
+		t.Fatalf("asked the service %v", w.requests)
+	}
+}
+
+func TestAForksOwnRun(t *testing.T) {
+	w := newWorld(t)
+	fork := w.gh.Fork(w.repo, w.contributor, w.gh.NewID())
+	run := w.gh.PushRun(fork, "main")
+	w.step(bins.disk, disk(run, "build"), nil).ok(t).says(t, "Outside the lanescape organization", "disk did nothing")
+	w.step(bins.saveDisk, testgithub.Job{Run: run}, nil).ok(t).says(t, "Outside the lanescape organization", "save-disk did nothing")
+	if len(w.requests) != 0 {
+		t.Fatalf("asked the service %v", w.requests)
+	}
+}
+
+func TestAForksPullRequestIntoTheOrganization(t *testing.T) {
+	w := newWorld(t)
+	fork := w.gh.Fork(w.repo, w.contributor, w.gh.NewID())
+	fork.Commit("feature", map[string]string{"x": "1"})
+	pr := w.gh.PullRequest(w.repo, "main", fork, "feature", w.contributor)
+	run := w.gh.PullRequestRun(pr)
+	// The service gives such a run none of its machines.
+	var refused *service.Refused
+	if _, err := w.svc.StartJob(w.svc.RunOf(run), large); !errors.As(err, &refused) {
+		t.Fatalf("the service gave a fork's pull request's job a machine: %v", err)
+	}
+	job := testgithub.Job{Run: run, Pull: pr, Inputs: map[string]string{"family": "build"}}
+	w.step(bins.disk, job, nil).ok(t).says(t, "Outside the lanescape organization", "a fork's pull request")
+	w.step(bins.saveDisk, testgithub.Job{Run: run, Pull: pr}, nil).ok(t).says(t, "a fork's pull request")
+	if len(w.requests) != 0 {
+		t.Fatalf("asked the service %v", w.requests)
+	}
+}
+
+// An approved contribution's pull_request_target run is bound at its
+// contribution job's check, once a maintainer approves it, and its build
+// job, which needs that job, gets its work disk in the pull request's
+// scope, and checks out the contribution's head.
+func TestAnApprovedContributionsDiskJob(t *testing.T) {
+	w := newWorld(t)
+	fork := w.gh.Fork(w.repo, w.contributor, w.gh.NewID())
+	fork.Commit("feature", map[string]string{"x": "1"})
+	pr := w.gh.PullRequest(w.repo, "main", fork, "feature", w.contributor)
 	run := w.gh.PullRequestTargetRun(pr)
-	srun := w.svc.RunOf(run)
-	r := w.step(bins.runners, testgithub.Job{Run: run, Pull: pr, IDToken: true}, w.job(srun, ""))
-	expectMap(t, r.runnersMap(t), map[string]any{
-		"lanescape-2vcpu-linux-arm64":  "lanescape-2vcpu-linux-arm64-read",
-		"lanescape-80vcpu-linux-amd64": "lanescape-80vcpu-linux-amd64-read",
-	})
-	w.bound(srun, "read")
-}
-
-func TestTheServiceRetriesWhileGitHubCantBeReached(t *testing.T) {
-	w := newWorld(t)
-	run, srun := w.push("main")
-	// GitHub can't be reached for the service's first three answers,
-	// which ask the action to try again, as the service's do.
-	w.svc.Faults().Add(fault.Rule{Method: http.MethodPost, PathPrefix: "/v1/bind", Times: 3, Respond: service.Unavailable(time.Second)})
-	r := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true}, w.job(srun, ""))
-	expectMap(t, r.runnersMap(t), map[string]any{
-		"lanescape-2vcpu-linux-arm64":  "lanescape-2vcpu-linux-arm64-main",
-		"lanescape-80vcpu-linux-amd64": "lanescape-80vcpu-linux-amd64-main",
-	})
-	// Each attempt gets a token afresh.
-	if !strings.Contains(r.log, "trying again") || len(w.gh.Audiences) != 4 {
-		t.Fatalf("no retry: %d tokens\n%s", len(w.gh.Audiences), r.log)
+	contribution := w.gh.Queue(run, ghemu.JobSpec{Name: "contribution", Labels: []string{small}, Environment: "contribution"})
+	if _, err := w.svc.StartWorkflowJob(contribution); !errors.Is(err, service.ErrWaiting) {
+		t.Fatalf("the contribution job before its approval: %v", err)
 	}
-	w.bound(srun, "main")
+	// Until then the run is unbound, and a job of it on the smallest
+	// shape gets no work disk.
+	unbound := w.start(run, small)
+	job := testgithub.Job{Run: run, Pull: pr, Inputs: map[string]string{"family": "build"}}
+	w.step(bins.disk, job, unbound).failed(t, "isn't bound")
+
+	w.svc.Approve(w.svc.RunOf(run))
+	if _, err := w.svc.StartWorkflowJob(contribution); err != nil {
+		t.Fatalf("the approved contribution job's check: %v", err)
+	}
+	scope := fmt.Sprintf("pr%d", pr.Number)
+	if s, ok := w.svc.Binding(w.svc.RunOf(run)); !ok || s != scope {
+		t.Fatalf("the contribution bound %q, %v", s, ok)
+	}
+	m := w.start(run, large)
+	m.mount(t, true)
+	w.step(bins.disk, job, m).ok(t).says(t, "Inside the lanescape organization", "pull_request_target", "is mounted at `/work`")
+	if d, _ := w.svc.WorkDisk(m.job); d.Scope != scope {
+		t.Fatalf("the work disk is in %q", d.Scope)
+	}
+	r := w.step(bins.checkout, testgithub.Job{Run: run, Pull: pr, Inputs: map[string]string{"contribution": "true"}}, m, "decide").ok(t)
+	if r.outputs["ref"] != run.EventPull.HeadSHA || r.outputs["persist-credentials"] != "false" {
+		t.Fatalf("checkout outputs %v", r.outputs)
+	}
+	w.step(bins.saveDisk, testgithub.Job{Run: run, Pull: pr}, m).ok(t).says(t, "the run's scope saves")
 }
 
-func TestTheActionFailsOnceItsRetriesAreSpent(t *testing.T) {
+func TestTheServiceRetriesUntilGitHubConfirms(t *testing.T) {
 	w := newWorld(t)
-	run, srun := w.push("main")
+	run := w.gh.PushRun(w.repo, "main")
+	m := w.start(run, large)
+	m.mount(t, true)
+	// GitHub confirms nothing until the program has asked twice.
 	w.svc.Unavailable(true)
-	r := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true}, w.job(srun, ""))
-	if r.err == nil || !strings.Contains(r.log, "retries are spent") || r.outputs["map"] != "" {
-		t.Fatalf("err = %v, outputs %v\n%s", r.err, r.outputs, r.log)
+	var asked atomic.Int32
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks", Match: func(*http.Request) bool {
+		if asked.Add(1) == 3 {
+			w.svc.Unavailable(false)
+		}
+		return false
+	}})
+	r := w.step(bins.disk, disk(run, "build"), m).ok(t)
+	if !strings.Contains(r.log, "trying again") || w.asked("/v1/disks") != 3 {
+		t.Fatalf("no retries were logged:\n%s", r.log)
 	}
-	if _, ok := w.svc.Binding(srun); ok {
-		t.Fatal("the run was bound while GitHub couldn't be reached")
-	}
-}
-
-func TestARefusedBindingFailsWithItsReason(t *testing.T) {
-	w := newWorld(t)
-	run, srun := w.push("main")
-	// The run's one job has finished, so GitHub shows the run completed.
-	j := w.job(srun, "")
-	w.svc.FinishJob(*j, "success")
-	w.gh.SetRunStatus(run, "completed")
-	r := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true}, j)
-	if r.err == nil || !strings.Contains(r.log, "refused to bind the run") || !strings.Contains(r.log, "the run isn't in progress") {
-		t.Fatalf("err = %v\n%s", r.err, r.log)
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks/save", Times: 2, Respond: fault.Unavailable(time.Second)})
+	if r := w.step(bins.saveDisk, testgithub.Job{Run: run}, m).ok(t); !strings.Contains(r.log, "trying again") {
+		t.Fatalf("no retries were logged:\n%s", r.log)
 	}
 }
 
-func TestAMissingListedFileFailsNamingIt(t *testing.T) {
+func TestTheActionsFailOnceTheirRetriesAreSpent(t *testing.T) {
 	w := newWorld(t)
-	run, srun := w.push("main")
-	r := w.step(bins.runners, testgithub.Job{Run: run, IDToken: true, Inputs: map[string]string{
-		"disks": `{"build": {"runner": "lanescape-80vcpu-linux-amd64", "from": ["deps/missing.json"]}}`,
-	}}, w.job(srun, ""))
-	if r.err == nil || !strings.Contains(r.log, "deps/missing.json isn't in lanescape/app") {
-		t.Fatalf("err = %v\n%s", r.err, r.log)
+	run := w.gh.PushRun(w.repo, "main")
+	m := w.start(run, large)
+	m.mount(t, true)
+	w.svc.Unavailable(true)
+	w.step(bins.disk, disk(run, "build"), m).failed(t, "retries are spent")
+	if n := w.asked("/v1/disks"); n != 8 {
+		t.Fatalf("asked %d times, not 8", n)
 	}
+	w.step(bins.saveDisk, testgithub.Job{Run: run}, m).failed(t, "retries are spent")
+}
+
+// A server in front of the service that's busy is retried too; any other
+// answer outside the interface fails at once.
+func TestAnswersFromInFront(t *testing.T) {
+	w := newWorld(t)
+	run := w.gh.PushRun(w.repo, "main")
+	m := w.start(run, large)
+	m.mount(t, true)
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks", Times: 1, Respond: fault.Status(http.StatusBadGateway, nil, "<html>bad gateway</html>")})
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks", Times: 1, Respond: fault.Status(http.StatusTooManyRequests, nil, "")})
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks", Times: 1, Respond: fault.Drop})
+	w.step(bins.disk, disk(run, "build"), m).ok(t)
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks", Times: 1,
+		Respond: fault.Status(http.StatusFound, http.Header{"Location": {w.svc.URL() + "/v1/disks"}}, "")})
+	before := w.asked("/v1/disks")
+	w.step(bins.disk, disk(run, "build"), m).failed(t, "answered 302, which its interface doesn't have")
+	if n := w.asked("/v1/disks") - before; n != 1 {
+		t.Fatalf("asked %d times, following a redirect or retrying it", n)
+	}
+}
+
+// A refusal fails the step with the service's reason, on one line, and
+// nothing the service says can bring the machine's token into the log.
+func TestARefusalFailsWithItsReason(t *testing.T) {
+	w := newWorld(t)
+	run := w.gh.PushRun(w.repo, "main")
+	m := w.start(run, large)
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks", Respond: func(rw http.ResponseWriter, r *http.Request) {
+		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		escaped := `\u` + fmt.Sprintf("%04x", tok[0]) + tok[1:]
+		fault.Status(http.StatusForbidden, nil, `{"reason": "no such thing\n::add-mask::x for `+escaped+`"}`)(rw, r)
+	}})
+	r := w.step(bins.disk, disk(run, "build"), m).failed(t, "no such thing ::add-mask::x for ***")
+	if strings.Contains(r.log, "\n::add-mask::x") {
+		t.Fatalf("the reason started a workflow command:\n%s", r.log)
+	}
+	w.step(bins.saveDisk, testgithub.Job{Run: run}, m).failed(t, "no such thing")
 }
 
 func TestCheckoutRefusesAContributionOutsidePullRequestTarget(t *testing.T) {
 	w := newWorld(t)
-	run, _ := w.push("main")
+	run := w.gh.PushRun(w.repo, "main")
 	r := w.step(bins.checkout, testgithub.Job{Run: run, Inputs: map[string]string{"contribution": "true"}}, nil, "decide")
 	if r.err == nil || !strings.Contains(r.log, "only in a pull_request_target run") || len(r.outputs) != 0 {
 		t.Fatalf("err = %v, outputs %v\n%s", r.err, r.outputs, r.log)
