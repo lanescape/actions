@@ -1,13 +1,13 @@
 # Lanescape Actions
 
-GitHub Actions for the repositories of the `lanescape` organization, for use with its runner service, [`lanescape/runners`](https://github.com/lanescape/runners). Workflows name the service's machines in `runs-on`, and the service binds each run itself. The actions build the images a run's commit defines, check out, and ask to save a work disk; outside the organization, in a fork or another organization, they do nothing of the service's.
+GitHub Actions for the repositories of the `lanescape` organization, for use with its runner service, [`lanescape/runners`](https://github.com/lanescape/runners). Workflows name the service's machines in `runs-on` by shape alone, and the service binds each run itself. The actions build the image a run's commit defines and output its reference for later jobs' containers, ask for a job's work disk, check out, and ask to save the work disk; outside the organization, in a fork or another organization, they do nothing of the service's.
 
 The code is public so that anyone can read it and contribute, but the service the actions call serves only the `lanescape` organization.
 
-- [0001 Actions](specs/0001-actions.md): runner labels, contributions, `image`, `checkout` and `save-disk`, and how each degrades outside the organization.
+- [0001 Actions](specs/0001-actions.md): runner labels, contributions, `image`, `disk`, `checkout` and `save-disk`, and how each degrades outside the organization.
 - [0002 Code, tests and releases](specs/0002-releases.md): Go, tests against `lanescape/runners`' emulator of the runner service and its other emulators, and the `v1` tag only the release App can move.
 
-So far `runners` and `checkout` are built. The specs now replace `runners` with `image`, and `save` with `save-disk`; those come next.
+So far `runners` and `checkout` are built. The specs now replace `runners` with `image` and `disk`, and `save` with `save-disk`; those come next.
 
 ## Development
 
