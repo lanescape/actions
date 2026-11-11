@@ -93,13 +93,18 @@ func TestMaking(t *testing.T) {
 	w := newWorld(t)
 	rt, c, tm, log := w.job(t, w.gh.PushRun(w.repo, "main"), "build", true)
 	w.svc.HoldDisks(true)
-	time.AfterFunc(100*time.Millisecond, func() { w.svc.HoldDisks(false) })
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks", Match: func(*http.Request) bool {
+		if w.asked.Load() == 3 {
+			w.svc.HoldDisks(false)
+		}
+		return false
+	}})
 	start := time.Now()
 	if err := run(context.Background(), rt, on(true), c, tm); err != nil {
 		t.Fatal(err)
 	}
 	n := int(w.asked.Load())
-	if elapsed := time.Since(start); n < 3 || time.Duration(n-1)*tm.making > elapsed {
+	if elapsed := time.Since(start); n != 3 || time.Duration(n-1)*tm.making > elapsed {
 		t.Fatalf("asked %d times in %s, every %s", n, elapsed, tm.making)
 	}
 	if strings.Count(log.String(), "is making the work disk") != 1 {

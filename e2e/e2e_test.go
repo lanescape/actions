@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -304,19 +305,25 @@ func TestAWorkDiskMadeWhileTheActionAsks(t *testing.T) {
 	w := newWorld(t)
 	run := w.gh.PushRun(w.repo, "main")
 	m := w.start(run, large)
+	// The disk is made once the program has asked three times, and the
+	// machine mounts it a moment after.
 	w.svc.HoldDisks(true)
+	var asked atomic.Int32
 	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		time.Sleep(200 * time.Millisecond)
-		w.svc.HoldDisks(false)
-		// The machine mounts it a moment after it's attached.
-		time.Sleep(100 * time.Millisecond)
-		m.mount(t, true)
-	}()
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks", Match: func(*http.Request) bool {
+		if asked.Add(1) == 3 {
+			w.svc.HoldDisks(false)
+			go func() {
+				defer close(done)
+				time.Sleep(50 * time.Millisecond)
+				m.mount(t, true)
+			}()
+		}
+		return false
+	}})
 	r := w.step(bins.disk, disk(run, "build"), m).ok(t).says(t, "is mounted at `/work`")
 	<-done
-	if !strings.Contains(r.log, "is making the work disk") || w.asked("/v1/disks") < 3 {
+	if !strings.Contains(r.log, "is making the work disk") || w.asked("/v1/disks") != 3 {
 		t.Fatalf("asked %d times while the disk was made:\n%s", w.asked("/v1/disks"), r.log)
 	}
 }
@@ -503,13 +510,17 @@ func TestTheServiceRetriesUntilGitHubConfirms(t *testing.T) {
 	run := w.gh.PushRun(w.repo, "main")
 	m := w.start(run, large)
 	m.mount(t, true)
+	// GitHub confirms nothing until the program has asked twice.
 	w.svc.Unavailable(true)
-	go func() {
-		time.Sleep(30 * time.Millisecond)
-		w.svc.Unavailable(false)
-	}()
+	var asked atomic.Int32
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks", Match: func(*http.Request) bool {
+		if asked.Add(1) == 3 {
+			w.svc.Unavailable(false)
+		}
+		return false
+	}})
 	r := w.step(bins.disk, disk(run, "build"), m).ok(t)
-	if !strings.Contains(r.log, "trying again") || w.asked("/v1/disks") < 2 {
+	if !strings.Contains(r.log, "trying again") || w.asked("/v1/disks") != 3 {
 		t.Fatalf("no retries were logged:\n%s", r.log)
 	}
 	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks/save", Times: 2, Respond: fault.Unavailable(time.Second)})
