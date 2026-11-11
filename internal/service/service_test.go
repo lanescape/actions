@@ -192,6 +192,9 @@ func TestRetries(t *testing.T) {
 		"a 503 from a server in front, without retryable": {[]fault.Rule{
 			{PathPrefix: "/v1/disks", Times: 1, Respond: fault.Status(http.StatusServiceUnavailable, nil, "<html>busy</html>")},
 		}, []time.Duration{2 * time.Second}},
+		"a busy proxy's 502 larger than any answer": {[]fault.Rule{
+			{PathPrefix: "/v1/disks", Times: 1, Respond: fault.Status(http.StatusBadGateway, nil, strings.Repeat("x", maxAnswer+1))},
+		}, []time.Duration{2 * time.Second}},
 		"429": {[]fault.Rule{
 			{PathPrefix: "/v1/disks", Times: 1, Respond: fault.Status(http.StatusTooManyRequests, http.Header{"Retry-After": {"2"}}, "")},
 		}, []time.Duration{2 * time.Second}},
@@ -288,6 +291,27 @@ func TestTheTokenIsNeverInAnError(t *testing.T) {
 		"a refusal's reason": func(tok string) func(http.ResponseWriter, *http.Request) {
 			return func(w http.ResponseWriter, r *http.Request) {
 				fault.Refuse("you sent "+strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))(w, r)
+			}
+		},
+		"a refusal's reason, escaped, beside a number too large for a float": func(tok string) func(http.ResponseWriter, *http.Request) {
+			return func(w http.ResponseWriter, r *http.Request) {
+				t := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+				escaped := `\u` + fmt.Sprintf("%04x", t[0]) + t[1:]
+				fault.Status(http.StatusForbidden, nil, `{"unused": 1e1000, "reason": "you sent `+escaped+`"}`)(w, r)
+			}
+		},
+		"a refusal's reason, escaped, with something after the answer": func(tok string) func(http.ResponseWriter, *http.Request) {
+			return func(w http.ResponseWriter, r *http.Request) {
+				t := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+				escaped := `\u` + fmt.Sprintf("%04x", t[0]) + t[1:]
+				fault.Status(http.StatusForbidden, nil, `{"reason": "you sent `+escaped+`"} x`)(w, r)
+			}
+		},
+		"a state, escaped, beside a number too large for a float": func(tok string) func(http.ResponseWriter, *http.Request) {
+			return func(w http.ResponseWriter, r *http.Request) {
+				t := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+				escaped := `\u` + fmt.Sprintf("%04x", t[0]) + t[1:]
+				fault.Status(http.StatusOK, nil, `{"unused": -1e1000, "state": "`+escaped+`", "restored": "none"}`)(w, r)
 			}
 		},
 		"a refusal's reason, escaped": func(tok string) func(http.ResponseWriter, *http.Request) {

@@ -53,12 +53,20 @@ type Client struct {
 // JSON object, a reason at most, so anything larger isn't one of them.
 const maxAnswer = 64 << 10
 
-// redact replaces the token wherever it appears in an answer: in its JSON
-// strings once decoded, however escaped, and in its raw bytes otherwise.
-func redact(data []byte, tok string) []byte {
+// redact replaces the token wherever it appears in an answer, in its
+// JSON strings once decoded, however escaped, and reports whether the
+// answer is one JSON value. An answer that isn't is never decoded: it
+// comes back with the token replaced in its raw bytes, for nothing but
+// its status to be read.
+func redact(data []byte, tok string) ([]byte, bool) {
+	raw := bytes.ReplaceAll(data, []byte(tok), []byte("***"))
+	dec := json.NewDecoder(bytes.NewReader(data))
+	// Numbers stay as they're written, so none too large for a float
+	// makes the answer undecodable here and decodable later.
+	dec.UseNumber()
 	var v any
-	if json.Unmarshal(data, &v) != nil {
-		return bytes.ReplaceAll(data, []byte(tok), []byte("***"))
+	if dec.Decode(&v) != nil || dec.Decode(new(any)) != io.EOF {
+		return raw, false
 	}
 	var walk func(any) any
 	walk = func(x any) any {
@@ -80,9 +88,9 @@ func redact(data []byte, tok string) []byte {
 	}
 	b, err := json.Marshal(walk(v))
 	if err != nil {
-		return bytes.ReplaceAll(data, []byte(tok), []byte("***"))
+		return raw, false
 	}
-	return b
+	return b, true
 }
 
 // DefaultRetry is how long a request waits for the service: eight attempts
@@ -187,21 +195,31 @@ func (c *Client) once(ctx context.Context, method, path string, body []byte, out
 	if err != nil {
 		return 0, errors.New("the runner service's answer couldn't be read")
 	}
+	asked := backoff.RetryAfter(resp.Header, time.Now())
+	// A 429 or 5xx is retried, whatever its body: what a server in front
+	// of the service says when it's busy or restarting isn't the
+	// interface's answer.
+	busy := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
 	if len(data) > maxAnswer {
+		if busy {
+			return asked, fmt.Errorf("it answered %d", resp.StatusCode)
+		}
 		return 0, final{errors.New("the runner service's answer is larger than any its interface gives")}
 	}
 	// Nothing the service sends back reaches the job's log with the
-	// token in it, whatever it says, however it's escaped.
-	data = redact(data, tok)
+	// token in it, whatever it says, however it's escaped; an answer
+	// that isn't JSON is never decoded.
+	data, isJSON := redact(data, tok)
 	var answer struct {
 		Reason    string `json:"reason"`
 		Retryable bool   `json:"retryable"`
 	}
-	jsonErr := json.Unmarshal(data, &answer)
-	asked := backoff.RetryAfter(resp.Header, time.Now())
+	if isJSON && json.Unmarshal(data, &answer) != nil {
+		answer.Reason, answer.Retryable = "", false
+	}
 	switch {
 	case resp.StatusCode == http.StatusOK:
-		if err := json.Unmarshal(data, out); err != nil {
+		if !isJSON || json.Unmarshal(data, out) != nil {
 			return 0, final{errors.New("the runner service answered 200 with a body that isn't its interface's")}
 		}
 		return 0, nil
@@ -210,11 +228,9 @@ func (c *Client) once(ctx context.Context, method, path string, body []byte, out
 			answer.Reason = "it gave no reason"
 		}
 		return 0, &Refused{Reason: oneLine(answer.Reason)}
-	case resp.StatusCode == http.StatusServiceUnavailable && jsonErr == nil && answer.Retryable:
+	case resp.StatusCode == http.StatusServiceUnavailable && answer.Retryable:
 		return asked, errors.New("it couldn't confirm an answer")
-	case resp.StatusCode >= 500, resp.StatusCode == http.StatusTooManyRequests:
-		// Not the interface's answer, but what a server in front of it
-		// says when it's busy or restarting.
+	case busy:
 		return asked, fmt.Errorf("it answered %d", resp.StatusCode)
 	default:
 		return 0, final{fmt.Errorf("the runner service answered %d, which its interface doesn't have", resp.StatusCode)}
