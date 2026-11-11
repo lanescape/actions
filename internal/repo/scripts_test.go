@@ -73,7 +73,7 @@ func TestTheBuildIgnoresTheJobsGoSettings(t *testing.T) {
 		t.Skip("builds a program")
 	}
 	sh := bash(t)
-	program, err := filepath.Abs(filepath.Join(root, "image"))
+	program, err := filepath.Abs(filepath.Join(root, "disk"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestTheBuildIgnoresTheJobsGoSettings(t *testing.T) {
 		"GOTOOLCHAIN=local", "RUNNER_TEMP=" + dir, "RUNNER_OS=" + map[string]string{"darwin": "macOS", "linux": "Linux"}[runtime.GOOS],
 		"PROGRAM=" + program, "GITHUB_ACTION_PATH=" + program,
 	}
-	path := filepath.Join(root, "image", "action.yml")
+	path := filepath.Join(root, "disk", "action.yml")
 
 	out := filepath.Join(dir, "find-output")
 	cmd := exec.Command(sh, "-e", "-c", stepScript(t, path, "Find Go"))

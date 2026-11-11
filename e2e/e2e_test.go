@@ -7,27 +7,28 @@
 // real service's answers.
 //
 // There is one GitHub: each test makes its repository, branches, pull
-// requests, runs and approvals in the GitHub emulator, which serves the
-// API and event a job sees, and the service emulator reads the same state
-// through service.WithGitHub. Its RepositoryOf, PullRequestOf and RunOf
-// give the service's handles for what a test made there.
+// requests, runs, jobs and approvals in the GitHub emulator, which serves
+// the API and event a job sees, and the service emulator reads the same
+// state through service.WithGitHub. Its RepositoryOf, RunOf and JobOf give
+// the service's handles for what a test made there.
 //
 // The programs are built with the e2e tag, which lets them call the
 // emulator in place of endpoints.Service, use a test's metadata server and
-// machine directory, and wait milliseconds; nothing else differs from what
-// the actions build.
+// stand-in for /proc/self/mountinfo, and wait milliseconds; nothing else
+// differs from what the actions build.
 package e2e
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,26 +36,34 @@ import (
 	ghemu "github.com/lanescape/runners/emulators/github"
 	"github.com/lanescape/runners/emulators/service"
 	"github.com/lanescape/runners/endpoints"
-	"github.com/lanescape/runners/machine"
 
 	"github.com/lanescape/actions/internal/testgithub"
 )
 
-const small = "lanescape-2vcpu-linux-amd64"
+const (
+	small = "lanescape-2vcpu-linux-amd64"
+	large = "lanescape-80vcpu-linux-amd64-spot"
+)
 
-// files are the repository's: two images, one for both architectures.
+// files are the repository's: two families of work disks, build, keyed by
+// go.sum, and cache, with one key.
 var files = map[string]string{
-	".github/runners.json":            `{"images": {"build": ".github/images/build", "multi": ".github/images/multi"}}`,
-	".github/images/build/image.json": `{"architectures": ["amd64"]}`,
-	".github/images/build/init.sh":    "apt-get install -y gcc\n",
-	".github/images/multi/image.json": `{"architectures": ["amd64", "arm64"]}`,
-	".github/images/multi/init.sh":    "apt-get install -y clang\n",
+	".github/runners.json": `{"disks": {"build": {"from": ["go.sum"]}, "cache": {}}}`,
+	"go.sum":               "example.com/a v1.0.0 h1:x\n",
 }
+
+// mounts are a machine's mounts, as /proc/self/mountinfo shows them, before
+// its work disk is mounted, and the line its mount adds.
+const (
+	mounts = "22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n" +
+		"25 22 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw\n"
+	workMount = "40 22 8:16 / /work rw,relatime shared:20 - ext4 /dev/sdb rw\n"
+)
 
 // bins are the programs, built once.
 var bins struct {
-	dir                       string
-	image, saveDisk, checkout string
+	dir                      string
+	disk, saveDisk, checkout string
 }
 
 func TestMain(m *testing.M) {
@@ -83,7 +92,7 @@ func buildAndRun(m *testing.M) (int, error) {
 		}
 		return out, nil
 	}
-	for name, into := range map[string]*string{"image": &bins.image, "save-disk": &bins.saveDisk, "checkout": &bins.checkout} {
+	for name, into := range map[string]*string{"disk": &bins.disk, "save-disk": &bins.saveDisk, "checkout": &bins.checkout} {
 		if *into, err = build(name); err != nil {
 			return 0, err
 		}
@@ -97,14 +106,19 @@ type world struct {
 	svc         *service.Emulator
 	org         *ghemu.Account
 	repo        *ghemu.Repo
-	srepo       service.Repository
-	member      *ghemu.Account
 	contributor *ghemu.Account
+	// elsewhere is the metadata server of a machine that isn't the
+	// service's: it has no attribute lsr-service, and gives no tokens.
+	elsewhere string
+
+	mu sync.Mutex
+	// requests are the requests that reached the service, by path.
+	requests []string
 }
 
 // newWorld starts the GitHub emulator, with the organization by its real
-// ID and a repository whose commit defines images, and the service
-// emulator, which reads the same GitHub.
+// ID and a repository whose commit declares families of work disks, and
+// the service emulator, which reads the same GitHub.
 func newWorld(t *testing.T) *world {
 	t.Helper()
 	if testing.Short() {
@@ -120,19 +134,71 @@ func newWorld(t *testing.T) *world {
 	repo := gh.Repo(org, gh.NewID(), "app")
 	repo.Commit("main", files)
 	gh.ProtectEnvironment(repo, "contribution")
-	return &world{t: t, gh: gh, svc: svc, org: org, repo: repo, srepo: svc.RepositoryOf(repo), member: gh.User(8001, "member"),
-		contributor: gh.User(9001, "contributor")}
+	elsewhere := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(elsewhere.Close)
+	w := &world{t: t, gh: gh, svc: svc, org: org, repo: repo, contributor: gh.User(9001, "contributor"), elsewhere: elsewhere.URL}
+	svc.Faults().Add(fault.Rule{PathPrefix: "/v1/", Match: func(r *http.Request) bool {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.requests = append(w.requests, r.URL.Path)
+		return false
+	}})
+	return w
 }
 
-// machine starts a job of a run on one of the service's base-image
+// asked is how many requests reached the service at path.
+func (w *world) asked(path string) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n := 0
+	for _, p := range w.requests {
+		if p == path {
+			n++
+		}
+	}
+	return n
+}
+
+// start starts a job of a run, naming a selector, on one of the service's
 // machines, which binds the run as the service's check would.
-func (w *world) machine(run *ghemu.Run) service.Job {
+func (w *world) start(run *ghemu.Run, selector string) *machine {
 	w.t.Helper()
-	j, err := w.svc.StartJob(w.svc.RunOf(run), small)
+	j, err := w.svc.StartJob(w.svc.RunOf(run), selector)
 	if err != nil {
 		w.t.Fatalf("the job's check: %v", err)
 	}
-	return j
+	return w.on(j)
+}
+
+// machine is one of the service's machines, running a job, with the
+// mounts its job's steps see.
+type machine struct {
+	job       service.Job
+	mountinfo string
+}
+
+func (w *world) on(j service.Job) *machine {
+	w.t.Helper()
+	m := &machine{job: j, mountinfo: filepath.Join(w.t.TempDir(), "mountinfo")}
+	m.mount(w.t, false)
+	return m
+}
+
+// mount shows the work disk mounted at /work, or not, as the machine
+// mounts it on the host.
+func (m *machine) mount(t *testing.T, mounted bool) {
+	info := mounts
+	if mounted {
+		info += workMount
+	}
+	tmp := m.mountinfo + ".new"
+	if err := os.WriteFile(tmp, []byte(info), 0o644); err != nil {
+		t.Error(err)
+		return
+	}
+	if err := os.Rename(tmp, m.mountinfo); err != nil {
+		t.Error(err)
+	}
 }
 
 // result is what a step left.
@@ -141,26 +207,26 @@ type result struct {
 	log     string
 	outputs map[string]string
 	summary string
-	dir     string
 }
 
-// step runs a program as a step of a job, as GitHub would. On a machine of
-// the service's, sj is the job as the service emulator knows it, whose
-// metadata server mints the machine's identity token, and the machine has
-// the service's directory; without one, it's some other runner.
-func (w *world) step(bin string, j testgithub.Job, sj *service.Job, args ...string) result {
+// step runs a program as a step of a job, as GitHub would. On one of the
+// service's machines, m, its metadata server answers the attribute
+// lsr-service and mints the machine's identity token; without one, it's
+// some other runner, whose metadata server has no such attribute.
+func (w *world) step(bin string, j testgithub.Job, m *machine, args ...string) result {
 	w.t.Helper()
 	env := w.gh.Env(j)
 	cmd := exec.Command(bin, args...)
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "LANESCAPE_TEST_SERVICE=" + w.svc.URL()}
-	dir := filepath.Join(w.t.TempDir(), "lanescape-runners")
-	if sj != nil {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+	if m != nil {
+		cmd.Env = append(cmd.Env, "LANESCAPE_TEST_METADATA="+w.svc.Metadata(m.job), "LANESCAPE_TEST_MOUNTINFO="+m.mountinfo)
+	} else {
+		info := filepath.Join(w.t.TempDir(), "mountinfo")
+		if err := os.WriteFile(info, []byte(mounts), 0o644); err != nil {
 			w.t.Fatal(err)
 		}
-		cmd.Env = append(cmd.Env, "LANESCAPE_TEST_METADATA="+w.svc.Metadata(*sj))
+		cmd.Env = append(cmd.Env, "LANESCAPE_TEST_METADATA="+w.elsewhere, "LANESCAPE_TEST_MOUNTINFO="+info)
 	}
-	cmd.Env = append(cmd.Env, "LANESCAPE_TEST_MACHINE_DIR="+dir)
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
@@ -171,20 +237,20 @@ func (w *world) step(bin string, j testgithub.Job, sj *service.Job, args ...stri
 	if err != nil && !errors.As(err, &ee) {
 		w.t.Fatal(err)
 	}
-	r := result{err: err, log: log.String(), outputs: testgithub.Outputs(w.t, env), summary: testgithub.Summary(w.t, env), dir: dir}
-	// No token handed to the job appears in its log, nor the machine's
-	// identity token.
+	r := result{err: err, log: log.String(), outputs: testgithub.Outputs(w.t, env), summary: testgithub.Summary(w.t, env)}
+	// No token handed to the job appears in its log or summary, nor the
+	// machine's identity token.
 	secrets := w.gh.Secrets()
-	if sj != nil {
-		secrets = append(secrets, w.svc.Token(*sj))
+	if m != nil {
+		secrets = append(secrets, w.svc.Token(m.job))
 	}
 	for _, s := range secrets {
-		if strings.Contains(strings.ReplaceAll(r.log, "::add-mask::"+s, ""), s) {
-			w.t.Fatalf("a token is in the step's log:\n%s", r.log)
+		if strings.Contains(strings.ReplaceAll(r.log, "::add-mask::"+s, ""), s) || strings.Contains(r.summary, s) {
+			w.t.Fatalf("a token is in the step's log or summary:\n%s\n%s", r.log, r.summary)
 		}
 	}
-	if strings.Contains(r.log, "eyJ") {
-		w.t.Fatalf("something like a token is in the step's log:\n%s", r.log)
+	if strings.Contains(r.log, "eyJ") || strings.Contains(r.summary, "eyJ") {
+		w.t.Fatalf("something like a token is in the step's log or summary:\n%s\n%s", r.log, r.summary)
 	}
 	return r
 }
@@ -197,195 +263,167 @@ func (r result) ok(t *testing.T) result {
 	return r
 }
 
-func (r result) failed(t *testing.T, says string) {
+func (r result) failed(t *testing.T, says string) result {
 	t.Helper()
-	if r.err == nil || !strings.Contains(r.log, says) {
+	if r.err == nil || !strings.Contains(r.log, "::error::") || !strings.Contains(r.log, says) {
 		t.Fatalf("err = %v; want a failure saying %q:\n%s", r.err, says, r.log)
 	}
+	return r
 }
 
-// ask is the build IDs the service started for a run's image, asked for as
-// the action does, from another job of the run.
-func (w *world) builds(run *ghemu.Run, image string) map[string]string {
-	w.t.Helper()
-	j := w.machine(run)
-	req, _ := http.NewRequest(http.MethodPost, w.svc.URL()+"/v1/images", strings.NewReader(`{"name": "`+image+`"}`))
-	req.Header.Set("Authorization", "Bearer "+w.svc.Token(j))
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		w.t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	var out struct {
-		Builds []struct {
-			Architecture, Build, State string
-		} `json:"builds"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || resp.StatusCode != http.StatusOK {
-		w.t.Fatalf("asking for %s: %d %v", image, resp.StatusCode, err)
-	}
-	ids := map[string]string{}
-	for _, b := range out.Builds {
-		ids[b.Architecture] = b.Build
-	}
-	return ids
-}
-
-func TestAnImageAlreadyBuilt(t *testing.T) {
-	w := newWorld(t)
-	run := w.gh.PushRun(w.repo, "main")
-	w.svc.FinishBuild(w.srepo, w.builds(run, "build")["amd64"], "built\n")
-	j := w.machine(run)
-	r := w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "build"}}, &j).ok(t)
-	if !strings.Contains(r.summary, "Inside the lanescape organization") || !strings.Contains(r.summary, "`amd64`") {
-		t.Fatalf("summary = %s", r.summary)
-	}
-	if strings.Contains(r.log, "built") {
-		t.Fatalf("a ready image's log was printed:\n%s", r.log)
-	}
-}
-
-func TestAnImageBuiltWhileTheActionWaits(t *testing.T) {
-	w := newWorld(t)
-	run := w.gh.PushRun(w.repo, "main")
-	id := w.builds(run, "build")["amd64"]
-	go func() {
-		time.Sleep(300 * time.Millisecond)
-		w.svc.FinishBuild(w.srepo, id, "installing gcc\n::add-mask::secret\n::set-output name=x::y")
-	}()
-	j := w.machine(run)
-	r := w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "build"}}, &j).ok(t)
-	if !strings.Contains(r.log, "installing gcc") || !strings.Contains(r.log, "::group::amd64 ") {
-		t.Fatalf("the build's log wasn't printed in its group:\n%s", r.log)
-	}
-	stopped(t, r.log)
-}
-
-// stopped checks that every part of a build's log was written with
-// workflow commands stopped, by a token of its own, and resumed after it,
-// each on a line of its own.
-func stopped(t *testing.T, log string) {
+func (r result) says(t *testing.T, texts ...string) result {
 	t.Helper()
-	lines := strings.Split(log, "\n")
-	var token string
-	tokens := map[string]bool{}
-	for i, l := range lines {
-		switch {
-		case strings.HasPrefix(l, "::stop-commands::"):
-			if token != "" {
-				t.Fatalf("commands stopped twice:\n%s", log)
-			}
-			token = strings.TrimPrefix(l, "::stop-commands::")
-			if len(token) < 32 || tokens[token] {
-				t.Fatalf("a part's token %q isn't new and random", token)
-			}
-			tokens[token] = true
-		case token != "" && l == "::"+token+"::":
-			token = ""
-		case token == "" && (strings.Contains(l, "::add-mask::") || strings.Contains(l, "::set-output")):
-			t.Fatalf("a line of the build's log at %d can act as a command:\n%s", i, log)
+	for _, s := range texts {
+		if !strings.Contains(r.summary, s) {
+			t.Fatalf("the summary doesn't say %q:\n%s\nlog:\n%s", s, r.summary, r.log)
 		}
 	}
-	if token != "" || len(tokens) == 0 {
-		t.Fatalf("commands weren't stopped and resumed:\n%s", log)
+	return r
+}
+
+func disk(run *ghemu.Run, family string) testgithub.Job {
+	return testgithub.Job{Run: run, Inputs: map[string]string{"family": family}}
+}
+
+func TestAWorkDiskReadyAtOnce(t *testing.T) {
+	w := newWorld(t)
+	run := w.gh.PushRun(w.repo, "main")
+	m := w.start(run, large)
+	m.mount(t, true)
+	w.step(bins.disk, disk(run, "build"), m).ok(t).
+		says(t, "Inside the lanescape organization", "family `build`, is mounted at `/work`", "(`none`)")
+	if d, ok := w.svc.WorkDisk(m.job); !ok || d.Family != "build" || !d.Ready || d.Scope != "main" {
+		t.Fatalf("the service's work disk = %+v, %v", d, ok)
+	}
+	if n := w.asked("/v1/disks"); n != 1 {
+		t.Fatalf("asked %d times for a disk ready at once", n)
 	}
 }
 
-func TestOneArchitectureReadyWhileAnotherBuilds(t *testing.T) {
+func TestAWorkDiskMadeWhileTheActionAsks(t *testing.T) {
 	w := newWorld(t)
 	run := w.gh.PushRun(w.repo, "main")
-	ids := w.builds(run, "multi")
-	w.svc.FinishBuild(w.srepo, ids["amd64"], "amd64 done\n")
+	m := w.start(run, large)
+	w.svc.HoldDisks(true)
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		time.Sleep(200 * time.Millisecond)
-		w.svc.FinishBuild(w.srepo, ids["arm64"], "arm64 part one\n")
+		w.svc.HoldDisks(false)
+		// The machine mounts it a moment after it's attached.
+		time.Sleep(100 * time.Millisecond)
+		m.mount(t, true)
 	}()
-	j := w.machine(run)
-	r := w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "multi"}}, &j).ok(t)
-	if !strings.Contains(r.log, "arm64 part one") || strings.Contains(r.log, "amd64 done") {
-		t.Fatalf("log:\n%s", r.log)
-	}
-	if !strings.Contains(r.summary, "`amd64`") || !strings.Contains(r.summary, "`arm64`") {
-		t.Fatalf("summary = %s", r.summary)
+	r := w.step(bins.disk, disk(run, "build"), m).ok(t).says(t, "is mounted at `/work`")
+	<-done
+	if !strings.Contains(r.log, "is making the work disk") || w.asked("/v1/disks") < 3 {
+		t.Fatalf("asked %d times while the disk was made:\n%s", w.asked("/v1/disks"), r.log)
 	}
 }
 
-func TestALogInPartsWithoutAFinalNewline(t *testing.T) {
+func TestAWorkDiskNeverMounted(t *testing.T) {
 	w := newWorld(t)
 	run := w.gh.PushRun(w.repo, "main")
-	id := w.builds(run, "build")["amd64"]
-	// The log comes in parts while the action follows it, one of them
-	// ending mid-line, and tries workflow commands across them.
-	go func() {
-		w.svc.WriteLog(id, "::warning::first part\n::add-")
-		time.Sleep(150 * time.Millisecond)
-		w.svc.WriteLog(id, "mask::half\n::error::no newline")
-		time.Sleep(150 * time.Millisecond)
-		w.svc.FinishBuild(w.srepo, id, "")
-	}()
-	j := w.machine(run)
-	r := w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "build"}}, &j).ok(t)
-	if !strings.Contains(r.log, "first part") || !strings.Contains(r.log, "no newline") {
-		t.Fatalf("log:\n%s", r.log)
+	m := w.start(run, large)
+	w.step(bins.disk, disk(run, "build"), m).failed(t, "isn't mounted at /work after")
+}
+
+// Where the disk came from, the answer's restored, is in the summary: here
+// main's disk for the key, saved by an earlier run's job.
+func TestWhereAWorkDiskCameFrom(t *testing.T) {
+	w := newWorld(t)
+	first := w.gh.PushRun(w.repo, "main")
+	m := w.start(first, large)
+	m.mount(t, true)
+	w.step(bins.disk, disk(first, "build"), m).ok(t)
+	w.step(bins.saveDisk, testgithub.Job{Run: first}, m).ok(t)
+	w.svc.FinishJob(m.job, "success")
+	if saved := w.svc.SavedDisks(w.svc.RepositoryOf(w.repo)); len(saved) != 1 || saved[0].Family != "build" {
+		t.Fatalf("saved %+v", saved)
 	}
-	stopped(t, r.log)
-	// The action's own commands work again after the log.
-	if i := strings.LastIndex(r.log, "::endgroup::"); i < 0 || !strings.Contains(r.log[i:], "is ready") {
-		t.Fatalf("the action didn't go on after the log:\n%s", r.log)
+	next := w.gh.PushRun(w.repo, "main")
+	m = w.start(next, large)
+	m.mount(t, true)
+	w.step(bins.disk, disk(next, "build"), m).ok(t).says(t, "main's disk for this key (`main_exact`)")
+}
+
+func TestAFamilyTheCommitDoesntDeclare(t *testing.T) {
+	w := newWorld(t)
+	run := w.gh.PushRun(w.repo, "main")
+	m := w.start(run, large)
+	m.mount(t, true)
+	w.step(bins.disk, disk(run, "tests"), m).failed(t, "doesn't declare the family tests")
+}
+
+// A job has one work disk: a second family is refused, and the same one
+// again succeeds at once.
+func TestOneWorkDiskForAJob(t *testing.T) {
+	w := newWorld(t)
+	run := w.gh.PushRun(w.repo, "main")
+	m := w.start(run, large)
+	m.mount(t, true)
+	w.step(bins.disk, disk(run, "build"), m).ok(t)
+	w.step(bins.disk, disk(run, "cache"), m).failed(t, "a job has one work disk")
+	w.step(bins.disk, disk(run, "build"), m).ok(t).says(t, "family `build`, is mounted")
+}
+
+func TestAFamilyThatIsntAName(t *testing.T) {
+	w := newWorld(t)
+	run := w.gh.PushRun(w.repo, "main")
+	m := w.start(run, large)
+	for _, f := range []string{"", "Build", "build-", "1build", strings.Repeat("a", 33), "a b"} {
+		w.step(bins.disk, disk(run, f), m).failed(t, "isn't a family's name")
+	}
+	if n := w.asked("/v1/disks"); n != 0 {
+		t.Fatalf("asked the service %d times", n)
 	}
 }
 
-func TestAFailedBuild(t *testing.T) {
+func TestSaveDiskInAScopeThatSaves(t *testing.T) {
 	w := newWorld(t)
 	run := w.gh.PushRun(w.repo, "main")
-	id := w.builds(run, "build")["amd64"]
-	go func() {
-		time.Sleep(200 * time.Millisecond)
-		w.svc.FailBuild(w.srepo, id, "E: Unable to locate package gcc\n")
-	}()
-	j := w.machine(run)
-	r := w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "build"}}, &j)
-	r.failed(t, "the image build's build for amd64 failed")
-	if !strings.Contains(r.log, "Unable to locate package gcc") {
-		t.Fatalf("the failed build's log wasn't printed:\n%s", r.log)
-	}
-	// Asked again in the same attempt, the action fails at once with the
-	// service's reason.
-	j2 := w.machine(run)
-	w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "build"}}, &j2).failed(t, "scripts failed")
-	// A maintainer's rerun asks for a new build, and the action waits for
-	// it.
-	w.gh.Rerun(run)
-	again := w.builds(run, "build")["amd64"]
-	if again == id {
-		t.Fatal("the rerun got the failed build")
-	}
-	go func() {
-		time.Sleep(200 * time.Millisecond)
-		w.svc.FinishBuild(w.srepo, again, "built at last\n")
-	}()
-	j3 := w.machine(run)
-	if r := w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "build"}}, &j3).ok(t); !strings.Contains(r.log, "built at last") {
-		t.Fatalf("the rerun's build's log:\n%s", r.log)
+	m := w.start(run, large)
+	m.mount(t, true)
+	w.step(bins.disk, disk(run, "build"), m).ok(t)
+	w.step(bins.saveDisk, testgithub.Job{Run: run}, m).ok(t).says(t, "the run's scope saves, so the runner service saves it")
+	if d, _ := w.svc.WorkDisk(m.job); !d.Save {
+		t.Fatal("the service wasn't asked to save the disk")
 	}
 }
 
-func TestAnImageTheCommitDoesntDeclare(t *testing.T) {
+// A push to a branch the consumer doesn't list is in the read scope, which
+// saves nothing; save-disk still succeeds, saying why.
+func TestSaveDiskInAScopeThatSavesNothing(t *testing.T) {
+	w := newWorld(t)
+	w.repo.Commit("feature", map[string]string{"x": "1"})
+	run := w.gh.PushRun(w.repo, "feature")
+	m := w.start(run, large)
+	m.mount(t, true)
+	w.step(bins.disk, disk(run, "build"), m).ok(t)
+	w.step(bins.saveDisk, testgithub.Job{Run: run}, m).ok(t).says(t, "saves nothing, so it won't be", "read")
+	w.svc.FinishJob(m.job, "success")
+	if saved := w.svc.SavedDisks(w.svc.RepositoryOf(w.repo)); len(saved) != 0 {
+		t.Fatalf("saved %+v", saved)
+	}
+}
+
+func TestSaveDiskWithNoWorkDisk(t *testing.T) {
 	w := newWorld(t)
 	run := w.gh.PushRun(w.repo, "main")
-	j := w.machine(run)
-	w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "other"}}, &j).
-		failed(t, "doesn't declare the image other")
+	m := w.start(run, large)
+	w.step(bins.saveDisk, testgithub.Job{Run: run}, m).failed(t, "no work disk")
 }
 
 func TestOnAMachineThatIsntTheServices(t *testing.T) {
 	w := newWorld(t)
 	run := w.gh.PushRun(w.repo, "main")
-	w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "build"}}, nil).
-		failed(t, "must run on one of the runner service's machines")
-	r := w.step(bins.saveDisk, testgithub.Job{Run: run}, nil).ok(t)
-	if !strings.Contains(r.log, "isn't one of the runner service's machines") {
+	r := w.step(bins.disk, disk(run, "build"), nil).ok(t).says(t, "Inside the lanescape organization", "isn't one of the runner service's machines")
+	if !strings.Contains(r.log, "does nothing here") {
 		t.Fatalf("log:\n%s", r.log)
+	}
+	w.step(bins.saveDisk, testgithub.Job{Run: run}, nil).ok(t).says(t, "isn't one of the runner service's machines")
+	if len(w.requests) != 0 {
+		t.Fatalf("asked the service %v", w.requests)
 	}
 }
 
@@ -393,13 +431,10 @@ func TestAForksOwnRun(t *testing.T) {
 	w := newWorld(t)
 	fork := w.gh.Fork(w.repo, w.contributor, w.gh.NewID())
 	run := w.gh.PushRun(fork, "main")
-	r := w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "build"}}, nil).ok(t)
-	if !strings.Contains(r.summary, "Outside the lanescape organization") || !strings.Contains(r.log, "does nothing here") {
-		t.Fatalf("summary = %s\nlog:\n%s", r.summary, r.log)
-	}
-	r = w.step(bins.saveDisk, testgithub.Job{Run: run}, nil).ok(t)
-	if !strings.Contains(r.summary, "Outside the lanescape organization") {
-		t.Fatalf("summary = %s", r.summary)
+	w.step(bins.disk, disk(run, "build"), nil).ok(t).says(t, "Outside the lanescape organization", "disk did nothing")
+	w.step(bins.saveDisk, testgithub.Job{Run: run}, nil).ok(t).says(t, "Outside the lanescape organization", "save-disk did nothing")
+	if len(w.requests) != 0 {
+		t.Fatalf("asked the service %v", w.requests)
 	}
 }
 
@@ -409,78 +444,129 @@ func TestAForksPullRequestIntoTheOrganization(t *testing.T) {
 	fork.Commit("feature", map[string]string{"x": "1"})
 	pr := w.gh.PullRequest(w.repo, "main", fork, "feature", w.contributor)
 	run := w.gh.PullRequestRun(pr)
-	r := w.step(bins.image, testgithub.Job{Run: run, Pull: pr, Inputs: map[string]string{"name": "build"}}, nil).ok(t)
-	if !strings.Contains(r.summary, "a fork's pull request") {
-		t.Fatalf("summary = %s", r.summary)
+	// The service gives such a run none of its machines.
+	var refused *service.Refused
+	if _, err := w.svc.StartJob(w.svc.RunOf(run), large); !errors.As(err, &refused) {
+		t.Fatalf("the service gave a fork's pull request's job a machine: %v", err)
+	}
+	job := testgithub.Job{Run: run, Pull: pr, Inputs: map[string]string{"family": "build"}}
+	w.step(bins.disk, job, nil).ok(t).says(t, "Outside the lanescape organization", "a fork's pull request")
+	w.step(bins.saveDisk, testgithub.Job{Run: run, Pull: pr}, nil).ok(t).says(t, "a fork's pull request")
+	if len(w.requests) != 0 {
+		t.Fatalf("asked the service %v", w.requests)
 	}
 }
 
-func TestAnApprovedContributionsImageJob(t *testing.T) {
+// An approved contribution's pull_request_target run is bound at its
+// contribution job's check, once a maintainer approves it, and its build
+// job, which needs that job, gets its work disk in the pull request's
+// scope, and checks out the contribution's head.
+func TestAnApprovedContributionsDiskJob(t *testing.T) {
 	w := newWorld(t)
 	fork := w.gh.Fork(w.repo, w.contributor, w.gh.NewID())
 	fork.Commit("feature", map[string]string{"x": "1"})
 	pr := w.gh.PullRequest(w.repo, "main", fork, "feature", w.contributor)
 	run := w.gh.PullRequestTargetRun(pr)
-	// Before a maintainer approves it, the run's plain job runs unbound,
-	// and an image is refused.
-	unbound := w.machine(run)
-	w.step(bins.image, testgithub.Job{Run: run, Pull: pr, Inputs: map[string]string{"name": "build"}}, &unbound).
-		failed(t, "isn't bound")
-	// Once approved, the contribution job's check binds it, and the image
-	// job, which needs it, has the image built.
+	contribution := w.gh.Queue(run, ghemu.JobSpec{Name: "contribution", Labels: []string{small}, Environment: "contribution"})
+	if _, err := w.svc.StartWorkflowJob(contribution); !errors.Is(err, service.ErrWaiting) {
+		t.Fatalf("the contribution job before its approval: %v", err)
+	}
+	// Until then the run is unbound, and a job of it on the smallest
+	// shape gets no work disk.
+	unbound := w.start(run, small)
+	job := testgithub.Job{Run: run, Pull: pr, Inputs: map[string]string{"family": "build"}}
+	w.step(bins.disk, job, unbound).failed(t, "isn't bound")
+
 	w.svc.Approve(w.svc.RunOf(run))
-	w.machine(run)
-	if s, ok := w.svc.Binding(w.svc.RunOf(run)); !ok || s != fmt.Sprintf("pr%d", pr.Number) {
+	if _, err := w.svc.StartWorkflowJob(contribution); err != nil {
+		t.Fatalf("the approved contribution job's check: %v", err)
+	}
+	scope := fmt.Sprintf("pr%d", pr.Number)
+	if s, ok := w.svc.Binding(w.svc.RunOf(run)); !ok || s != scope {
 		t.Fatalf("the contribution bound %q, %v", s, ok)
 	}
-	id := w.builds(run, "build")["amd64"]
-	w.svc.FinishBuild(w.srepo, id, "")
-	j := w.machine(run)
-	w.step(bins.image, testgithub.Job{Run: run, Pull: pr, Inputs: map[string]string{"name": "build"}}, &j).ok(t)
+	m := w.start(run, large)
+	m.mount(t, true)
+	w.step(bins.disk, job, m).ok(t).says(t, "Inside the lanescape organization", "pull_request_target", "is mounted at `/work`")
+	if d, _ := w.svc.WorkDisk(m.job); d.Scope != scope {
+		t.Fatalf("the work disk is in %q", d.Scope)
+	}
+	r := w.step(bins.checkout, testgithub.Job{Run: run, Pull: pr, Inputs: map[string]string{"contribution": "true"}}, m, "decide").ok(t)
+	if r.outputs["ref"] != run.EventPull.HeadSHA || r.outputs["persist-credentials"] != "false" {
+		t.Fatalf("checkout outputs %v", r.outputs)
+	}
+	w.step(bins.saveDisk, testgithub.Job{Run: run, Pull: pr}, m).ok(t).says(t, "the run's scope saves")
 }
 
-func TestTheServiceRetriesUntilItCanAnswer(t *testing.T) {
+func TestTheServiceRetriesUntilGitHubConfirms(t *testing.T) {
 	w := newWorld(t)
 	run := w.gh.PushRun(w.repo, "main")
-	id := w.builds(run, "build")["amd64"]
-	j := w.machine(run)
-	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/images", Times: 3, Respond: service.Unavailable(time.Second)})
-	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/images", Times: 1, Respond: fault.Status(http.StatusBadGateway, nil, "bad gateway")})
+	m := w.start(run, large)
+	m.mount(t, true)
+	w.svc.Unavailable(true)
 	go func() {
-		time.Sleep(300 * time.Millisecond)
-		w.svc.FinishBuild(w.srepo, id, "")
+		time.Sleep(30 * time.Millisecond)
+		w.svc.Unavailable(false)
 	}()
-	r := w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "build"}}, &j).ok(t)
-	if !strings.Contains(r.log, "trying again") {
+	r := w.step(bins.disk, disk(run, "build"), m).ok(t)
+	if !strings.Contains(r.log, "trying again") || w.asked("/v1/disks") < 2 {
+		t.Fatalf("no retries were logged:\n%s", r.log)
+	}
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks/save", Times: 2, Respond: fault.Unavailable(time.Second)})
+	if r := w.step(bins.saveDisk, testgithub.Job{Run: run}, m).ok(t); !strings.Contains(r.log, "trying again") {
 		t.Fatalf("no retries were logged:\n%s", r.log)
 	}
 }
 
-func TestTheActionFailsOnceItsRetriesAreSpent(t *testing.T) {
+func TestTheActionsFailOnceTheirRetriesAreSpent(t *testing.T) {
 	w := newWorld(t)
 	run := w.gh.PushRun(w.repo, "main")
-	j := w.machine(run)
-	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/images", Respond: service.Unavailable(time.Second)})
-	w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "build"}}, &j).failed(t, "retries are spent")
+	m := w.start(run, large)
+	m.mount(t, true)
+	w.svc.Unavailable(true)
+	w.step(bins.disk, disk(run, "build"), m).failed(t, "retries are spent")
+	if n := w.asked("/v1/disks"); n != 8 {
+		t.Fatalf("asked %d times, not 8", n)
+	}
+	w.step(bins.saveDisk, testgithub.Job{Run: run}, m).failed(t, "retries are spent")
 }
 
+// A server in front of the service that's busy is retried too; any other
+// answer outside the interface fails at once.
+func TestAnswersFromInFront(t *testing.T) {
+	w := newWorld(t)
+	run := w.gh.PushRun(w.repo, "main")
+	m := w.start(run, large)
+	m.mount(t, true)
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks", Times: 1, Respond: fault.Status(http.StatusBadGateway, nil, "<html>bad gateway</html>")})
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks", Times: 1, Respond: fault.Status(http.StatusTooManyRequests, nil, "")})
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks", Times: 1, Respond: fault.Drop})
+	w.step(bins.disk, disk(run, "build"), m).ok(t)
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks", Times: 1,
+		Respond: fault.Status(http.StatusFound, http.Header{"Location": {w.svc.URL() + "/v1/disks"}}, "")})
+	before := w.asked("/v1/disks")
+	w.step(bins.disk, disk(run, "build"), m).failed(t, "answered 302, which its interface doesn't have")
+	if n := w.asked("/v1/disks") - before; n != 1 {
+		t.Fatalf("asked %d times, following a redirect or retrying it", n)
+	}
+}
+
+// A refusal fails the step with the service's reason, on one line, and
+// nothing the service says can bring the machine's token into the log.
 func TestARefusalFailsWithItsReason(t *testing.T) {
 	w := newWorld(t)
 	run := w.gh.PushRun(w.repo, "main")
-	j := w.machine(run)
-	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/images", Respond: service.Refuse("no such thing")})
-	w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "build"}}, &j).failed(t, "no such thing")
-}
-
-func TestSaveDiskAsksForASave(t *testing.T) {
-	w := newWorld(t)
-	run := w.gh.PushRun(w.repo, "main")
-	j := w.machine(run)
-	r := w.step(bins.saveDisk, testgithub.Job{Run: run}, &j).ok(t)
-	b, err := os.ReadFile(filepath.Join(r.dir, filepath.Base(machine.SaveMarker)))
-	if err != nil || string(b) != machine.SaveRequest {
-		t.Fatalf("save request = %q, %v", b, err)
+	m := w.start(run, large)
+	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks", Respond: func(rw http.ResponseWriter, r *http.Request) {
+		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		escaped := `\u` + fmt.Sprintf("%04x", tok[0]) + tok[1:]
+		fault.Status(http.StatusForbidden, nil, `{"reason": "no such thing\n::add-mask::x for `+escaped+`"}`)(rw, r)
+	}})
+	r := w.step(bins.disk, disk(run, "build"), m).failed(t, "no such thing ::add-mask::x for ***")
+	if strings.Contains(r.log, "\n::add-mask::x") {
+		t.Fatalf("the reason started a workflow command:\n%s", r.log)
 	}
+	w.step(bins.saveDisk, testgithub.Job{Run: run}, m).failed(t, "no such thing")
 }
 
 func TestCheckoutRefusesAContributionOutsidePullRequestTarget(t *testing.T) {
@@ -490,82 +576,4 @@ func TestCheckoutRefusesAContributionOutsidePullRequestTarget(t *testing.T) {
 	if r.err == nil || !strings.Contains(r.log, "only in a pull_request_target run") || len(r.outputs) != 0 {
 		t.Fatalf("err = %v, outputs %v\n%s", r.err, r.outputs, r.log)
 	}
-}
-
-func TestAFinishedBuildsWholeLogIsPrinted(t *testing.T) {
-	w := newWorld(t)
-	run := w.gh.PushRun(w.repo, "main")
-	id := w.builds(run, "build")["amd64"]
-	// More than one answer's worth of log, all written as the build ends,
-	// while the action follows it.
-	go func() {
-		time.Sleep(200 * time.Millisecond)
-		w.svc.WriteLog(id, strings.Repeat("a line of output\n", 150_000)+"the last line\n")
-		w.svc.FinishBuild(w.srepo, id, "")
-	}()
-	j := w.machine(run)
-	r := w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "build"}}, &j).ok(t)
-	// A line split between two answers is printed in its two halves.
-	if n := strings.Count(r.log, "a line of output"); n < 149_999 || !strings.Contains(r.log, "the last line") {
-		t.Fatalf("printed %d lines of the log, and its last: %v", n, strings.Contains(r.log, "the last line"))
-	}
-}
-
-func TestAFailedArchitectureFailsBeforeAnotherIsFollowed(t *testing.T) {
-	w := newWorld(t)
-	run := w.gh.PushRun(w.repo, "main")
-	ids := w.builds(run, "multi")
-	w.svc.FailBuild(w.srepo, ids["arm64"], "")
-	followed := 0
-	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/images/builds/", Respond: func(rw http.ResponseWriter, r *http.Request) {
-		followed++
-		service.Unavailable(time.Second)(rw, r)
-	}})
-	j := w.machine(run)
-	w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "multi"}}, &j).failed(t, "build for arm64 failed")
-	if followed != 0 {
-		t.Fatalf("followed amd64's build %d times before failing on arm64's", followed)
-	}
-}
-
-func TestAFailedBuildsReasonComesFirst(t *testing.T) {
-	w := newWorld(t)
-	run := w.gh.PushRun(w.repo, "main")
-	ids := w.builds(run, "multi")
-	// amd64 fails with a log while arm64's service answers keep failing.
-	followedArm := 0
-	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/images/builds/" + ids["arm64"], Respond: func(rw http.ResponseWriter, r *http.Request) {
-		followedArm++
-		service.Unavailable(time.Second)(rw, r)
-	}})
-	// The first look at amd64's build is held while it fails, so the
-	// action sees it failed, with its log, on that look.
-	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/images/builds/" + ids["amd64"], Times: 1, Delay: 300 * time.Millisecond})
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		w.svc.FailBuild(w.srepo, ids["amd64"], "E: broken\n")
-	}()
-	j := w.machine(run)
-	r := w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "multi"}}, &j)
-	r.failed(t, "build for amd64 failed")
-	if !strings.Contains(r.log, "E: broken") || strings.Contains(r.log, "retries are spent") || followedArm != 0 {
-		t.Fatalf("log:\n%s", r.log)
-	}
-}
-
-func TestAFailedBuildsReasonOutlivesItsLog(t *testing.T) {
-	w := newWorld(t)
-	run := w.gh.PushRun(w.repo, "main")
-	id := w.builds(run, "build")["amd64"]
-	w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/images/builds/" + id, Times: 1, Delay: 300 * time.Millisecond})
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		w.svc.FailBuild(w.srepo, id, "E: broken\n")
-		// The rest of its log can't be read.
-		time.Sleep(300 * time.Millisecond)
-		w.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/images/builds/" + id, Respond: service.Unavailable(time.Second)})
-	}()
-	j := w.machine(run)
-	r := w.step(bins.image, testgithub.Job{Run: run, Inputs: map[string]string{"name": "build"}}, &j)
-	r.failed(t, "build for amd64 failed: the image's scripts failed")
 }

@@ -1,7 +1,9 @@
 name: Lanescape save-disk
 description: >
   Asks the runner service to save the job's work disk when the job
-  finishes, if the job succeeds and its scope and selector allow.
+  finishes, which it does if the job succeeds and the run's scope saves.
+  Outside the lanescape organization, or on a runner that isn't the
+  service's, it does nothing.
 runs:
   using: composite
   steps:

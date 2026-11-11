@@ -58,9 +58,9 @@ jobs:
     name: Check out with checkout (${{ matrix.platform }})
     # The checkout action itself, as a consumer's job runs it, for the run's
     # own commit. A contribution's checkout needs a pull_request_target
-    # run, so the tests cover it up to actions/checkout. The runners
-    # action isn't run here, since it would call the runner service, which
-    # CI never relies on.
+    # run, so the tests cover it up to actions/checkout. disk and save-disk
+    # aren't run here, since they call the runner service, which CI never
+    # relies on; the end-to-end tests run them against its emulator.
     runs-on: ${{ github.repository_owner_id == '303994381' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && matrix.blacksmith || matrix.github }}
     strategy:
       fail-fast: false

@@ -13,8 +13,8 @@ import (
 
 // In a binary built with the e2e tag, for the end-to-end tests alone, the
 // service is the test service at LANESCAPE_TEST_SERVICE, the metadata
-// server and the service's directory are the test's, and waits are
-// milliseconds rather than seconds. No action.yml builds with that tag.
+// server and the mounts are the test's, and waits are milliseconds rather
+// than seconds. No action.yml builds with that tag.
 
 func address() string {
 	if u := os.Getenv("LANESCAPE_TEST_SERVICE"); u != "" {
@@ -29,8 +29,22 @@ func defaultRetry() backoff.Policy {
 	return p
 }
 
-// FollowEvery is how often the image action asks how a build goes.
-func FollowEvery() time.Duration { return 20 * time.Millisecond }
+// MakingEvery is how often disk asks again while its work disk is being
+// made.
+func MakingEvery() time.Duration { return 20 * time.Millisecond }
+
+// MountWait is how long disk waits for /work to be mounted, and MountEvery
+// how often it looks.
+func MountWait() time.Duration  { return 500 * time.Millisecond }
+func MountEvery() time.Duration { return 10 * time.Millisecond }
+
+// MountInfo is the test's stand-in for /proc/self/mountinfo.
+func MountInfo() string {
+	if p := os.Getenv("LANESCAPE_TEST_MOUNTINFO"); p != "" {
+		return p
+	}
+	return "/proc/self/mountinfo"
+}
 
 // MetadataServer is the test's metadata server.
 func MetadataServer() string {
@@ -38,12 +52,4 @@ func MetadataServer() string {
 		return u
 	}
 	return "http://metadata.google.internal"
-}
-
-// MachineDir is the test machine's directory.
-func MachineDir() string {
-	if d := os.Getenv("LANESCAPE_TEST_MACHINE_DIR"); d != "" {
-		return d
-	}
-	return "/var/lib/lanescape-runners"
 }

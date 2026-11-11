@@ -1,12 +1,11 @@
-name: Lanescape image
+name: Lanescape disk
 description: >
-  Has the runner service build the image the run's commit defines, if it
-  isn't built yet, and waits for it, writing its build's log. Run it in a
-  job that the jobs booting the image need, on one of the service's
-  machines.
+  Asks the runner service for the job's work disk, of a family, and waits
+  until it's mounted at /work. Outside the lanescape organization, or on a
+  runner that isn't the service's, it does nothing.
 inputs:
-  name:
-    description: The image's name, as .github/runners.json declares it at the run's commit.
+  family:
+    description: The family's name, as .github/runners.json declares it at the run's commit.
     required: true
 runs:
   using: composite
@@ -90,9 +89,9 @@ runs:
         fi
         build go build -trimpath -o "$bin" "./$name"
         echo "bin=$bin" >> "$GITHUB_OUTPUT"
-    - name: Build the image
+    - name: Ask for the work disk
       shell: bash
       env:
         PROGRAM: ${{ steps.build.outputs.bin }}
-        INPUT_NAME: ${{ inputs.name }}
+        INPUT_FAMILY: ${{ inputs.family }}
       run: '"$PROGRAM"'

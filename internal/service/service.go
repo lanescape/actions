@@ -15,10 +15,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/lanescape/runners/endpoints"
 
@@ -50,10 +49,9 @@ type Client struct {
 	url string
 }
 
-// maxAnswer bounds an answer: at most a mebibyte of a build's log, as
-// lanescape/runners' spec 0005 has the service give it, escaped as JSON may
-// escape it, six bytes for every byte at most, with room to spare.
-const maxAnswer = 8 << 20
+// maxAnswer bounds an answer: every answer the interface has is a small
+// JSON object, a reason at most, so anything larger isn't one of them.
+const maxAnswer = 64 << 10
 
 // redact replaces the token wherever it appears in an answer: in its JSON
 // strings once decoded, however escaped, and in its raw bytes otherwise.
@@ -211,7 +209,7 @@ func (c *Client) once(ctx context.Context, method, path string, body []byte, out
 		if answer.Reason == "" {
 			answer.Reason = "it gave no reason"
 		}
-		return 0, &Refused{Reason: answer.Reason}
+		return 0, &Refused{Reason: oneLine(answer.Reason)}
 	case resp.StatusCode == http.StatusServiceUnavailable && jsonErr == nil && answer.Retryable:
 		return asked, errors.New("it couldn't confirm an answer")
 	case resp.StatusCode >= 500, resp.StatusCode == http.StatusTooManyRequests:
@@ -223,61 +221,79 @@ func (c *Client) once(ctx context.Context, method, path string, body []byte, out
 	}
 }
 
-// Build is one architecture's state of an image the run asked for.
-type Build struct {
-	Architecture string `json:"architecture"`
-	Version      string `json:"version"`
-	State        string `json:"state"`
-	Build        string `json:"build"`
-	Reason       string `json:"reason"`
-}
-
-// The states of a build.
+// The states of a work disk's answer.
 const (
-	Ready    = "ready"
-	Building = "building"
-	Failed   = "failed"
+	Making = "making"
+	Ready  = "ready"
 )
 
-// Image asks for an image of the run's commit, by name (POST /v1/images).
-func (c *Client) Image(ctx context.Context, name string) ([]Build, error) {
-	body, _ := json.Marshal(map[string]string{"name": name})
-	var out struct {
-		Builds []Build `json:"builds"`
-	}
-	if err := c.do(ctx, http.MethodPost, "/v1/images", body, &out); err != nil {
-		return nil, err
-	}
-	if len(out.Builds) == 0 {
-		return nil, errors.New("the runner service answered with no builds")
-	}
-	for _, b := range out.Builds {
-		if b.Architecture == "" || b.Version == "" || (b.State != Ready && b.State != Building && b.State != Failed) ||
-			(b.State == Building && b.Build == "") {
-			return nil, errors.New("the runner service answered with a build its interface doesn't have")
-		}
-	}
-	return out.Builds, nil
+// Steps are where a work disk may come from, as its answer's restored
+// says: a resume image, or a step of the restore order
+// (lanescape/runners' specs/0005-interface.md, Work disks).
+var Steps = map[string]string{
+	"resume":              "a resume image of this job's own disk",
+	"pull_request_exact":  "the pull request's own disk for this key",
+	"pull_request_newest": "the pull request's newest disk",
+	"main_exact":          "main's disk for this key",
+	"main_newest":         "main's newest disk",
+	"branch_exact":        "the branch's disk for this key",
+	"branch_newest":       "the branch's newest disk",
+	"none":                "nothing: a new, empty disk",
 }
 
-// Progress is a build's state, and its log from an offset.
-type Progress struct {
-	State  string `json:"state"`
-	Reason string `json:"reason"`
-	Log    string `json:"log"`
-	Next   int64  `json:"next"`
+// Disk is the service's answer to a work disk request.
+type Disk struct {
+	// State is Making or Ready.
+	State string `json:"state"`
+	// Restored is where the disk came from, one of Steps.
+	Restored string `json:"restored"`
 }
 
-// Follow is a build's state and its log from offset (GET
-// /v1/images/builds/<id>).
-func (c *Client) Follow(ctx context.Context, build string, offset int64) (Progress, error) {
-	var out Progress
-	path := "/v1/images/builds/" + url.PathEscape(build) + "?offset=" + strconv.FormatInt(offset, 10)
-	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
-		return Progress{}, err
+// Disk asks for the job's work disk, of a family (POST /v1/disks), once,
+// retrying only what the interface says to retry.
+func (c *Client) Disk(ctx context.Context, family string) (Disk, error) {
+	body, _ := json.Marshal(map[string]string{"family": family})
+	var out Disk
+	if err := c.do(ctx, http.MethodPost, "/v1/disks", body, &out); err != nil {
+		return Disk{}, err
 	}
-	if out.State != Ready && out.State != Building && out.State != Failed || out.Next < offset {
-		return Progress{}, fmt.Errorf("the runner service answered with a build's state its interface doesn't have: %q", out.State)
+	if out.State != Making && out.State != Ready {
+		return Disk{}, fmt.Errorf("the runner service answered with a work disk's state its interface doesn't have: %q", out.State)
+	}
+	if _, ok := Steps[out.Restored]; !ok {
+		return Disk{}, fmt.Errorf("the runner service answered that the work disk came from %q, which its interface doesn't have", out.Restored)
 	}
 	return out, nil
+}
+
+// Save is the service's answer to a save request.
+type Save struct {
+	// Saves is whether the run's scope saves, so the disk is saved if the
+	// job succeeds.
+	Saves bool
+	// Reason is why it doesn't, if it doesn't.
+	Reason string
+}
+
+// Save asks for the job's work disk to be saved when the job finishes
+// (POST /v1/disks/save).
+func (c *Client) Save(ctx context.Context) (Save, error) {
+	var out struct {
+		Saves  *bool  `json:"saves"`
+		Reason string `json:"reason"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/v1/disks/save", []byte(`{"save":true}`), &out); err != nil {
+		return Save{}, err
+	}
+	if out.Saves == nil || *out.Saves == (out.Reason != "") {
+		return Save{}, errors.New("the runner service answered a save with a body its interface doesn't have")
+	}
+	return Save{Saves: *out.Saves, Reason: oneLine(out.Reason)}, nil
+}
+
+// oneLine is a reason of the service's, as the job's log may show it: on
+// one line, with no control characters, so it can't start a workflow
+// command of its own.
+func oneLine(s string) string {
+	return strings.Join(strings.FieldsFunc(s, func(r rune) bool { return unicode.IsControl(r) || unicode.IsSpace(r) }), " ")
 }
