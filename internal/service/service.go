@@ -191,15 +191,25 @@ func (c *Client) once(ctx context.Context, method, path string, body []byte, out
 		return 0, errors.New("the runner service couldn't be reached")
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxAnswer+1))
-	if err != nil {
-		return 0, errors.New("the runner service's answer couldn't be read")
-	}
 	asked := backoff.RetryAfter(resp.Header, time.Now())
 	// A 429 or 5xx is retried, whatever its body: what a server in front
 	// of the service says when it's busy or restarting isn't the
 	// interface's answer.
 	busy := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxAnswer+1))
+	if err != nil {
+		// A body cut short is a connection lost, but the status still
+		// says what to do: a refusal stays one, and only an answer
+		// worth asking again for is asked for again.
+		switch {
+		case resp.StatusCode == http.StatusForbidden:
+			return 0, &Refused{Reason: "its reason couldn't be read"}
+		case busy, resp.StatusCode == http.StatusOK:
+			return asked, errors.New("its answer couldn't be read")
+		default:
+			return 0, final{fmt.Errorf("the runner service answered %d, which its interface doesn't have", resp.StatusCode)}
+		}
+	}
 	if len(data) > maxAnswer {
 		if busy {
 			return asked, fmt.Errorf("it answered %d", resp.StatusCode)

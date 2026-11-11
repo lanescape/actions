@@ -119,6 +119,7 @@ func TestVerify(t *testing.T) {
 	for _, kv := range [][2]string{
 		{"http.https://github.com/.extraheader", "AUTHORIZATION: basic x"},
 		{"includeIf.gitdir:/x.path", "/tmp/credentials"},
+		{"credential.helper", "store"},
 	} {
 		gitIn(t, ws, "config", "--local", kv[0], kv[1])
 		if err := verify(ctx, runtime(env)); err == nil || !strings.Contains(err.Error(), "may hold credentials") {

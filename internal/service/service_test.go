@@ -447,3 +447,59 @@ func audience(tok string) string {
 	}
 	return c.Aud + " " + format
 }
+
+// cut answers with a status, and a body cut short, as when the connection
+// is lost while it's read.
+func cut(code int, header http.Header) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		for k, vs := range header {
+			w.Header()[k] = vs
+		}
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(code)
+		_, _ = w.Write([]byte(`{"reason": "a`))
+	}
+}
+
+// A body cut short keeps what its status says: a refusal isn't retried,
+// a 503 waits as its Retry-After asks, and a 200 is asked for again.
+func TestAnAnswerCutShort(t *testing.T) {
+	e := setup(t)
+	e.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks", Respond: cut(http.StatusForbidden, nil)})
+	n := e.count()
+	var r *Refused
+	if _, err := e.c.Disk(context.Background(), "build"); !errors.As(err, &r) || *n != 1 {
+		t.Fatalf("a refusal cut short: %v, after %d requests", err, *n)
+	}
+
+	e = setup(t)
+	e.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks", Times: 1, Respond: cut(http.StatusServiceUnavailable, http.Header{"Retry-After": {"60"}})})
+	e.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks", Times: 1, Respond: cut(http.StatusOK, nil)})
+	if _, err := e.c.Disk(context.Background(), "build"); err != nil {
+		t.Fatal(err)
+	}
+	if got := *e.waits; len(got) != 2 || got[0] != time.Minute || got[1] != 4*time.Second {
+		t.Fatalf("waits = %v", got)
+	}
+
+	e = setup(t)
+	e.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks", Respond: cut(http.StatusTeapot, nil)})
+	n = e.count()
+	if _, err := e.c.Disk(context.Background(), "build"); err == nil || *n != 1 {
+		t.Fatalf("a status outside the interface, cut short: %v, after %d requests", err, *n)
+	}
+}
+
+// A save's reason that echoes the token, escaped, never brings it out.
+func TestTheTokenIsNeverInASavesReason(t *testing.T) {
+	e := setup(t)
+	e.svc.Faults().Add(fault.Rule{PathPrefix: "/v1/disks/save", Respond: func(w http.ResponseWriter, r *http.Request) {
+		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		escaped := `\u` + fmt.Sprintf("%04x", tok[0]) + tok[1:]
+		fault.Status(http.StatusOK, nil, `{"saves": false, "reason": "you sent `+escaped+`"}`)(w, r)
+	}})
+	s, err := e.c.Save(context.Background())
+	if err != nil || e.tokens.last == "" || strings.Contains(s.Reason, e.tokens.last) || s.Reason != "you sent ***" {
+		t.Fatalf("save = %+v, %v", s, err)
+	}
+}
